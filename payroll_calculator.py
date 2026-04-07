@@ -1120,12 +1120,15 @@ def apply_notes(entries, notes, rules):
                 ):
                     target = special_rule["hours"]
 
-            if target is None:
+            # Holiday: pay the exact hours specified in the notes — never cap to schedule.
+            # Time Off: cap to one day's scheduled hours per date, spread as needed.
+            if item["kind"] == "Holiday":
+                add_hours = remaining
+            elif target is None:
                 continue
+            else:
+                add_hours = round(min(remaining, target), 2)
 
-            # Leave is additive — allocate up to one day's scheduled hours per date,
-            # regardless of how much was worked that day.
-            add_hours = round(min(remaining, target), 2)
             if add_hours <= 0:
                 continue
 
