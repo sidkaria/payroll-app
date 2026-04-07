@@ -775,13 +775,9 @@ def parse_xlsx_notes(path):
         status = cell_to_text(worksheet.cell(row, 2).value)
         schedule_text = cell_to_text(worksheet.cell(row, 3).value)
 
-        # Break hours: from dedicated column when present, else parsed from schedule text
-        if has_break_col:
-            break_hours = parse_break_hours(cell_to_text(worksheet.cell(row, 4).value))
-        else:
-            break_hours = parse_break_hours(schedule_text)
-
-        schedule = parse_schedule_text(schedule_text, override_break=break_hours if has_break_col else None)
+        # Break Time column is detected for column-offset only — we no longer apply break
+        # deductions to the schedule. ADP captures real punch hours including any break gaps.
+        schedule = parse_schedule_text(schedule_text, override_break=0.0)
         notes["employees"][employee] = {
             "status": status,
             "schedule_text": schedule_text,
@@ -818,33 +814,40 @@ def parse_xlsx_notes(path):
                 }
             )
 
-        outside_pairs = pair_date_lines_with_descriptions(
-            worksheet.cell(row, 6 + o).value,
-            worksheet.cell(row, 7 + o).value,
-        )
-        fallback_break = break_hours
+        outside_dates_raw = worksheet.cell(row, 6 + o).value
+        outside_hours_raw = worksheet.cell(row, 7 + o).value
+        all_outside_dates = expand_date_expression(outside_dates_raw)
+        if all_outside_dates:
+            hours_lines = [ln.strip() for ln in cell_to_text(outside_hours_raw).splitlines() if ln.strip()]
+            if len(hours_lines) == len(all_outside_dates):
+                # Per-date hours: pair line by line
+                date_hours_pairs = [(d, parse_float(h)) for d, h in zip(all_outside_dates, hours_lines)]
+            else:
+                # Consolidated total divided evenly across dates
+                total_hrs = parse_float(outside_hours_raw)
+                per_day = round(total_hrs / len(all_outside_dates), 4) if total_hrs else None
+                date_hours_pairs = [(d, per_day) for d in all_outside_dates]
 
-        for date_expr, description in outside_pairs:
-            schedule_override = parse_schedule_override(description, fallback_break=fallback_break)
-            for work_date in expand_date_expression(date_expr):
+            outside_desc = cell_to_text(outside_hours_raw).strip()
+            for work_date, approved_hours in date_hours_pairs:
                 notes["outside_schedule"].append(
                     {
                         "employee": employee,
                         "date": work_date,
-                        "description": description,
-                        "schedule_override": schedule_override,
+                        "description": outside_desc,
+                        "approved_hours": approved_hours,
                     }
                 )
 
-        time_off_dates = worksheet.cell(row, 8 + o).value
+        # Time Off: dates are no longer required — just the hours total as a lump sum
         time_off_hours = parse_float(worksheet.cell(row, 9 + o).value)
-        if expand_date_expression(time_off_dates) and time_off_hours:
+        if time_off_hours:
             notes["leave_entries"].append(
                 {
                     "kind": "Time Off",
                     "employee": employee,
-                    "dates": expand_date_expression(time_off_dates),
-                    "date_label": cell_to_text(time_off_dates),
+                    "dates": [],
+                    "date_label": "",
                     "hours": round(time_off_hours, 2),
                 }
             )
@@ -1082,9 +1085,6 @@ def apply_notes(entries, notes, rules):
         first_in = record["corrected_start"] or record["raw_first_in"]
         schedule_info = schedule_for_date(schedule, work_date)
 
-        if outside and outside.get("schedule_override"):
-            schedule_info = outside["schedule_override"]
-
         record["actual_hours"] = round(actual_hours, 2)
         record["outside_approved"] = bool(outside)
         record["outside_description"] = outside["description"] if outside else ""
@@ -1093,15 +1093,22 @@ def apply_notes(entries, notes, rules):
             record["schedule_label"] = schedule_info["label"]
 
         final_work = actual_hours
-        if rules.get("cap_to_schedule") and schedule_info and not outside:
+        if outside:
+            approved_hours = outside.get("approved_hours")
+            if approved_hours is not None:
+                # Use the exact hours Megha wrote — no schedule cap
+                final_work = approved_hours
+                record["notes"].append(f"Approved: {approved_hours:.2f} hrs")
+            else:
+                # Approved but no explicit hours — pass through ADP uncapped
+                if outside.get("description"):
+                    record["notes"].append(f"Approved exception: {outside['description']}")
+        elif rules.get("cap_to_schedule") and schedule_info:
             if actual_hours > schedule_info["paid_hours"]:
                 record["notes"].append(
                     f"Capped to schedule ({schedule_info['paid_hours']:.2f} hrs)"
                 )
             final_work = min(actual_hours, schedule_info["paid_hours"])
-
-        if outside and outside.get("description"):
-            record["notes"].append(f"Approved exception: {outside['description']}")
 
         if special_rule and work_date == special_rule.get("date"):
             status = cell_to_text(meta.get("status")).lower()
@@ -1128,6 +1135,13 @@ def apply_notes(entries, notes, rules):
     for item in resolved_leave_entries:
         employee = item["employee"]
         remaining = round(item["hours"], 2)
+
+        # Time Off with no dates: lump sum — add directly, no date-based spreading
+        if item["kind"] == "Time Off" and not item["dates"]:
+            leave_allocations[employee]["Time Off"] += remaining
+            item["log_item"]["allocated_hours"] = remaining
+            continue
+
         for work_date in sorted(item["dates"]):
             record = get_or_create_day(day_records, employee, work_date)
             target = record["schedule_hours"]
@@ -1163,7 +1177,7 @@ def apply_notes(entries, notes, rules):
             if remaining <= 0.01:
                 break
 
-        if remaining > 0.01:
+        if remaining > 0.01 and item["dates"]:
             logs["review"].append(
                 {
                     "employee": employee,
