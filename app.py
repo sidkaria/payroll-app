@@ -53,12 +53,28 @@ with col_b:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def validate_adp(raw: bytes) -> tuple[bool, str]:
+def validate_adp(raw: bytes, filename: str) -> tuple[bool, str]:
     try:
-        first_line = raw.decode("utf-8-sig").split("\n")[0]
-        if "Date range" in first_line or "Employee Name" in first_line:
-            return True, ""
-        return False, "First row doesn't look like an ADP export. Expected 'Date range' or 'Employee Name' header."
+        ext = Path(filename).suffix.lower()
+        if ext in (".xlsx", ".xlsm"):
+            # Binary Excel — validate by reading the first cell
+            wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+            ws = wb.active
+            first = str(ws.cell(1, 1).value or "")
+            if "Date range" in first or "Employee" in first:
+                return True, ""
+            # Also check row 2 in case of blank rows at top
+            for r in range(1, 6):
+                val = str(ws.cell(r, 1).value or "")
+                if "Date range" in val or "Employee Name" in val:
+                    return True, ""
+            return False, "First column doesn't look like an ADP export. Expected 'Date range' or 'Employee Name'."
+        else:
+            # CSV — decode as text
+            first_line = raw.decode("utf-8-sig").split("\n")[0]
+            if "Date range" in first_line or "Employee Name" in first_line:
+                return True, ""
+            return False, "First row doesn't look like an ADP export. Expected 'Date range' or 'Employee Name' header."
     except Exception as exc:
         return False, str(exc)
 
@@ -82,7 +98,7 @@ adp_bytes = notes_bytes = None
 if adp_file:
     adp_bytes = adp_file.read()
     adp_file.seek(0)
-    adp_ok, adp_msg = validate_adp(adp_bytes)
+    adp_ok, adp_msg = validate_adp(adp_bytes, adp_file.name)
     if not adp_ok:
         st.error(f"ADP file issue: {adp_msg}")
 
