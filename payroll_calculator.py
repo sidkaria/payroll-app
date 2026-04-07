@@ -52,6 +52,10 @@ def parse_time(value):
     if value is None:
         return None
 
+    # Already a time object (e.g. from openpyxl reading an Excel ADP export)
+    if isinstance(value, dtime):
+        return value
+
     text = str(value).strip().rstrip(".")
     if not text:
         return None
@@ -259,14 +263,15 @@ WEEKDAY_MAP = {
 
 
 def parse_break_hours(text):
-    lowered = text.lower()
-    if "deduct no break" in lowered or "no break" in lowered:
+    lowered = text.lower().strip()
+    if not lowered or lowered == "-":
         return 0.0
-
-    match = re.search(r"deduct\s+(\d+(?:\.\d+)?)\s*hour", lowered)
+    if "no break" in lowered:
+        return 0.0
+    # Matches "deduct 1 hour", "deduct 1 hours", "1 hour", "1 hours"
+    match = re.search(r"(?:deduct\s+)?(\d+(?:\.\d+)?)\s*hours?", lowered)
     if match:
         return float(match.group(1))
-
     return 0.0
 
 
@@ -312,9 +317,14 @@ def parse_weekday_group(text):
     return []
 
 
-def parse_schedule_text(text):
+def parse_schedule_text(text, override_break=None):
+    """
+    Parse schedule text into a schedule dict.
+    override_break: if provided (from a dedicated Break Time column), use it
+                    instead of parsing break hours from the schedule text.
+    """
     raw = cell_to_text(text)
-    if not raw or raw.lower() == "give worked hours":
+    if not raw or raw.lower() in ("give worked hours", "as needed"):
         return {"mode": "actual", "label": raw}
 
     if "|" in raw:
@@ -327,7 +337,7 @@ def parse_schedule_text(text):
             timerange = parse_time_range(match.group(2))
             if not days or not timerange:
                 continue
-            break_hours = parse_break_hours(part)
+            break_hours = override_break if override_break is not None else parse_break_hours(part)
             info = schedule_info_from_range(
                 timerange["start"], timerange["end"], break_hours=break_hours, source_text=part
             )
@@ -340,7 +350,7 @@ def parse_schedule_text(text):
 
     timerange = parse_time_range(raw)
     if timerange:
-        break_hours = parse_break_hours(raw)
+        break_hours = override_break if override_break is not None else parse_break_hours(raw)
         info = schedule_info_from_range(
             timerange["start"], timerange["end"], break_hours=break_hours, source_text=raw
         )
@@ -503,6 +513,77 @@ def parse_adp_csv(path):
     }
 
 
+def parse_adp_xlsx(path):
+    """Parse an ADP export saved as Excel (.xlsx). Same column layout as the CSV."""
+    workbook = openpyxl.load_workbook(path, data_only=True)
+    worksheet = workbook.active
+
+    entries = []
+    pay_period_start = None
+    pay_period_end = None
+    current_name = None
+
+    for row in worksheet.iter_rows(values_only=True):
+        # Row 1: Date range header
+        if row[0] == "Date range" and len(row) >= 3:
+            pay_period_start = parse_date_value(row[1])
+            pay_period_end = parse_date_value(row[2])
+            continue
+
+        if row[0] == "Employee Name":
+            continue
+
+        if not any(row):
+            continue
+
+        name = cell_to_text(row[0])
+        if name:
+            current_name = name
+
+        if not current_name:
+            continue
+
+        work_date = parse_date_value(row[2])
+        if not work_date:
+            continue
+
+        in_time_obj = parse_time(row[3])
+        out_time_obj = parse_time(row[4])
+        # Format times as strings for display
+        in_time_str = in_time_obj.strftime("%I:%M %p").lstrip("0") if in_time_obj else ""
+        out_time_str = out_time_obj.strftime("%I:%M %p").lstrip("0") if out_time_obj else ""
+
+        hours = parse_float(row[5]) or 0.0
+        note = cell_to_text(row[9]) if len(row) > 9 else ""
+
+        entries.append(
+            {
+                "employee": current_name,
+                "date": work_date,
+                "in_time": in_time_str,
+                "out_time": out_time_str,
+                "in_time_obj": in_time_obj,
+                "out_time_obj": out_time_obj,
+                "hours": hours,
+                "note": note,
+            }
+        )
+
+    return {
+        "entries": entries,
+        "pay_period_start": pay_period_start,
+        "pay_period_end": pay_period_end,
+    }
+
+
+def parse_adp(path):
+    """Dispatch to the correct ADP parser based on file extension."""
+    suffix = Path(path).suffix.lower()
+    if suffix in (".xlsx", ".xlsm"):
+        return parse_adp_xlsx(path)
+    return parse_adp_csv(path)
+
+
 def _extract_kv(cells):
     data = {}
     index = 0
@@ -632,6 +713,26 @@ def parse_xlsx_notes(path):
     workbook = openpyxl.load_workbook(path, data_only=True)
     worksheet = workbook[workbook.sheetnames[0]]
 
+    # Find the header row dynamically — it's the row whose col 1 = "Employee".
+    # This tolerates blank rows at the top that vary file to file.
+    header_row = None
+    for r in range(1, min(20, worksheet.max_row + 1)):
+        if cell_to_text(worksheet.cell(r, 1).value).strip() == "Employee":
+            header_row = r
+            break
+    if header_row is None:
+        header_row = 2  # fallback
+
+    # Detect whether the sheet has a dedicated "Break Time" column (col 4).
+    # New format: Employee | Status | Schedule | Break Time | Missed date | ...
+    # Old format: Employee | Status | Schedule | Missed date | ...
+    col4_header = cell_to_text(worksheet.cell(header_row, 4).value).strip().lower()
+    has_break_col = "break" in col4_header
+    # Column offset: 1 when Break Time column is present, 0 otherwise
+    o = 1 if has_break_col else 0
+    # Data rows start two rows after the header (one sub-header row in between)
+    data_start = header_row + 2
+
     notes = {
         "source_type": "xlsx",
         "employees": {},
@@ -642,7 +743,7 @@ def parse_xlsx_notes(path):
         "prompts": parse_workbook_prompts(worksheet),
     }
 
-    for row in range(4, worksheet.max_row + 1):
+    for row in range(data_start, worksheet.max_row + 1):
         employee = cell_to_text(worksheet.cell(row, 1).value)
         if employee == "Additional Notes:":
             break
@@ -651,36 +752,55 @@ def parse_xlsx_notes(path):
 
         status = cell_to_text(worksheet.cell(row, 2).value)
         schedule_text = cell_to_text(worksheet.cell(row, 3).value)
-        schedule = parse_schedule_text(schedule_text)
+
+        # Break hours: from dedicated column when present, else parsed from schedule text
+        if has_break_col:
+            break_hours = parse_break_hours(cell_to_text(worksheet.cell(row, 4).value))
+        else:
+            break_hours = parse_break_hours(schedule_text)
+
+        schedule = parse_schedule_text(schedule_text, override_break=break_hours if has_break_col else None)
         notes["employees"][employee] = {
             "status": status,
             "schedule_text": schedule_text,
             "schedule": schedule,
         }
 
-        missed_date_value = worksheet.cell(row, 4).value
-        missed_text = cell_to_text(worksheet.cell(row, 5).value)
-        for work_date in expand_date_expression(missed_date_value):
-            if missed_text:
-                notes["missed_punches"].append(
-                    {
-                        "employee": employee,
-                        "date": work_date,
-                        "text": missed_text,
-                        "source_note": missed_text,
-                    }
-                )
+        # Pair each missed-punch date with its corresponding punch sequence.
+        # Handles three layouts Megha uses:
+        #   1. Single date + single punch line  (most common)
+        #   2. Multiple dates on separate lines + matching punch lines (newline-separated)
+        #   3. Multiple dates on one line (space-separated) + matching punch lines
+        missed_date_raw = worksheet.cell(row, 4 + o).value
+        missed_text_raw = cell_to_text(worksheet.cell(row, 5 + o).value)
+
+        all_dates = expand_date_expression(missed_date_raw)
+        text_lines = [ln.strip() for ln in missed_text_raw.splitlines() if ln.strip()]
+
+        if len(all_dates) > 1 and len(all_dates) == len(text_lines):
+            # Each date pairs with the same-position text line
+            date_text_pairs = list(zip(all_dates, text_lines))
+        else:
+            # Single date or counts don't match — apply full text to every date
+            date_text_pairs = [(d, missed_text_raw) for d in all_dates]
+
+        for work_date, missed_text in date_text_pairs:
+            if not missed_text:
+                continue
+            notes["missed_punches"].append(
+                {
+                    "employee": employee,
+                    "date": work_date,
+                    "text": missed_text,
+                    "source_note": missed_text,
+                }
+            )
 
         outside_pairs = pair_date_lines_with_descriptions(
-            worksheet.cell(row, 6).value,
-            worksheet.cell(row, 7).value,
+            worksheet.cell(row, 6 + o).value,
+            worksheet.cell(row, 7 + o).value,
         )
-        fallback_schedule = notes["employees"][employee]["schedule"]
-        fallback_break = 0.0
-        if fallback_schedule.get("mode") == "scheduled":
-            weekday_zero = fallback_schedule.get("by_weekday", {})
-            if weekday_zero:
-                fallback_break = next(iter(weekday_zero.values()))["break_hours"]
+        fallback_break = break_hours
 
         for date_expr, description in outside_pairs:
             schedule_override = parse_schedule_override(description, fallback_break=fallback_break)
@@ -694,8 +814,8 @@ def parse_xlsx_notes(path):
                     }
                 )
 
-        time_off_dates = worksheet.cell(row, 8).value
-        time_off_hours = parse_float(worksheet.cell(row, 9).value)
+        time_off_dates = worksheet.cell(row, 8 + o).value
+        time_off_hours = parse_float(worksheet.cell(row, 9 + o).value)
         if expand_date_expression(time_off_dates) and time_off_hours:
             notes["leave_entries"].append(
                 {
@@ -707,8 +827,8 @@ def parse_xlsx_notes(path):
                 }
             )
 
-        holiday_dates = worksheet.cell(row, 10).value
-        holiday_hours = parse_float(worksheet.cell(row, 11).value)
+        holiday_dates = worksheet.cell(row, 10 + o).value
+        holiday_hours = parse_float(worksheet.cell(row, 11 + o).value)
         if expand_date_expression(holiday_dates) and holiday_hours:
             notes["leave_entries"].append(
                 {
@@ -982,7 +1102,6 @@ def apply_notes(entries, notes, rules):
         record["final_work_hours"] = round(final_work, 2)
 
     leave_allocations = defaultdict(lambda: {"Time Off": 0.0, "Holiday": 0.0})
-    leave_allocations_by_day = defaultdict(lambda: {"Time Off": 0.0, "Holiday": 0.0})
 
     for item in resolved_leave_entries:
         employee = item["employee"]
@@ -1004,19 +1123,12 @@ def apply_notes(entries, notes, rules):
             if target is None:
                 continue
 
-            already_allocated = (
-                leave_allocations_by_day[(employee, work_date)]["Time Off"]
-                + leave_allocations_by_day[(employee, work_date)]["Holiday"]
-            )
-            gap = round(max(0.0, target - record["final_work_hours"] - already_allocated), 2)
-            if gap <= 0:
-                continue
-
-            add_hours = round(min(remaining, gap), 2)
+            # Leave is additive — allocate up to one day's scheduled hours per date,
+            # regardless of how much was worked that day.
+            add_hours = round(min(remaining, target), 2)
             if add_hours <= 0:
                 continue
 
-            leave_allocations_by_day[(employee, work_date)][item["kind"]] += add_hours
             leave_allocations[employee][item["kind"]] += add_hours
             item["log_item"]["allocated_hours"] = round(
                 item["log_item"]["allocated_hours"] + add_hours, 2
@@ -1033,7 +1145,7 @@ def apply_notes(entries, notes, rules):
                     "date": item["date_label"],
                     "issue": (
                         f"Unallocated {item['kind'].lower()} hours remaining "
-                        f"({remaining:.2f}); workbook needs a date-by-date split"
+                        f"({remaining:.2f}); split hours by date in the notes sheet"
                     ),
                 }
             )
@@ -1281,7 +1393,7 @@ def main():
     output_path = csv_path.parent / f"{csv_path.stem}_corrected.xlsx"
 
     print(f"Reading ADP data:      {csv_path}")
-    adp = parse_adp_csv(csv_path)
+    adp = parse_adp(csv_path)
     entries = adp["entries"]
     print(f"  -> {len(entries)} punch rows across {len(set(entry['employee'] for entry in entries))} employees")
 

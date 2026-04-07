@@ -12,7 +12,7 @@ from payroll_calculator import (
     apply_notes,
     fmt_hours,
     normalize_name,
-    parse_adp_csv,
+    parse_adp,
     parse_notes,
     parse_workbook_rules,
     weekday_dates_only,
@@ -40,7 +40,7 @@ col_a, col_b = st.columns(2)
 with col_a:
     adp_file = st.file_uploader(
         "**ADP Export**",
-        type=["csv"],
+        type=["csv", "xlsx"],
         help="The CSV exported from ADP — e.g. ADPPayroll.csv. File name doesn't matter.",
     )
 
@@ -117,9 +117,10 @@ if run:
     with st.spinner("Calculating…"):
         try:
             # Save uploads to temp files (the calculator expects file paths)
+            ext_adp = Path(adp_file.name).suffix.lower()
             ext_notes = Path(notes_file.name).suffix.lower()
 
-            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=ext_adp, delete=False) as f:
                 adp_file.seek(0)
                 f.write(adp_file.read())
                 tmp_csv = f.name
@@ -133,7 +134,7 @@ if run:
                 tmp_out = f.name
 
             # Core calculation
-            adp = parse_adp_csv(tmp_csv)
+            adp = parse_adp(tmp_csv)
             entries = adp["entries"]
             notes = parse_notes(tmp_notes)
             rules = parse_workbook_rules(notes)
