@@ -172,10 +172,29 @@ def split_nonempty_lines(value):
 
 
 def parse_float(value):
-    if value is None or str(value).strip() == "":
+    if value is None:
         return None
+    # openpyxl returns datetime.time for cells like "8:00" — treat as hours
+    if isinstance(value, dtime):
+        return round(value.hour + value.minute / 60, 4)
+    text = str(value).strip()
+    if not text:
+        return None
+    # Multiline cells (e.g. "8:00\n8:00\n8:00") — sum each line
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        total = sum(v for ln in lines for v in [parse_float(ln)] if v is not None)
+        return round(total, 4) if total > 0 else None
+    # "H:MM" format like "8:00" or "2:30"
+    m = re.match(r'^(\d+):(\d{2})$', text)
+    if m:
+        return round(int(m.group(1)) + int(m.group(2)) / 60, 4)
+    # "8H" or "8 hrs" etc.
+    m2 = re.match(r'^(\d+(?:\.\d+)?)\s*[hH]', text)
+    if m2:
+        return float(m2.group(1))
     try:
-        return float(value)
+        return float(text)
     except (TypeError, ValueError):
         return None
 
@@ -268,6 +287,9 @@ def parse_break_hours(text):
         return 0.0
     if "no break" in lowered:
         return 0.0
+    # "1/2 hour" = 30 min break
+    if re.search(r"1/2\s*hours?", lowered):
+        return 0.5
     # Matches "deduct 1 hour", "deduct 1 hours", "1 hour", "1 hours"
     match = re.search(r"(?:deduct\s+)?(\d+(?:\.\d+)?)\s*hours?", lowered)
     if match:
