@@ -22,12 +22,12 @@ from payroll_calculator import (
 # ── Page config ──────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Bel Air Payroll Calculator",
+    page_title="Shamit Payroll Calculator",
     page_icon="📋",
     layout="centered",
 )
 
-st.title("📋 Bel Air Payroll Calculator")
+st.title("📋 Shamit Payroll Calculator")
 st.caption(
     "Upload your ADP export (CSV) and payroll notes (Excel) to generate a corrected hours report."
 )
