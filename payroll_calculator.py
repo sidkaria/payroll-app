@@ -290,7 +290,11 @@ def parse_break_hours(text):
     # "1/2 hour" = 30 min break
     if re.search(r"1/2\s*hours?", lowered):
         return 0.5
-    # Matches "deduct 1 hour", "deduct 1 hours", "1 hour", "1 hours"
+    # "30 min", "30 minutes", "30 minute break"
+    m = re.search(r"(\d+)\s*min(?:utes?)?", lowered)
+    if m:
+        return round(int(m.group(1)) / 60, 4)
+    # "deduct 1 hour", "1 hour break", "1 hour", etc.
     match = re.search(r"(?:deduct\s+)?(\d+(?:\.\d+)?)\s*hours?", lowered)
     if match:
         return float(match.group(1))
@@ -775,9 +779,13 @@ def parse_xlsx_notes(path):
         status = cell_to_text(worksheet.cell(row, 2).value)
         schedule_text = cell_to_text(worksheet.cell(row, 3).value)
 
-        # Break Time column is detected for column-offset only — we no longer apply break
-        # deductions to the schedule. ADP captures real punch hours including any break gaps.
-        schedule = parse_schedule_text(schedule_text, override_break=0.0)
+        # Break hours: from dedicated column when present, else parsed from schedule text
+        if has_break_col:
+            break_hours = parse_break_hours(cell_to_text(worksheet.cell(row, 4).value))
+        else:
+            break_hours = parse_break_hours(schedule_text)
+
+        schedule = parse_schedule_text(schedule_text, override_break=break_hours if has_break_col else None)
         notes["employees"][employee] = {
             "status": status,
             "schedule_text": schedule_text,
