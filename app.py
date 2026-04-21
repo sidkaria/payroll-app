@@ -205,18 +205,20 @@ if run:
         total_payable = round(total_worked + total_leave, 2)
 
         n_corrected = sum(1 for c in logs["corrections"] if c["status"] == "CORRECTED")
+        n_anomalies = len(logs.get("anomalies", []))
         n_review = len(logs["review"]) + sum(
             1 for c in logs["corrections"] if c["status"] == "REVIEW"
         )
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Employees", len(all_employees))
         m2.metric("Total Payable", fmt_hours(total_payable))
         m3.metric("Corrections", n_corrected)
+        m4.metric("⚠ Anomalies" if n_anomalies else "Anomalies", n_anomalies)
         if n_review:
-            m4.metric("⚠ Needs Review", n_review)
+            m5.metric("⚠ Needs Review", n_review)
         else:
-            m4.metric("Needs Review", 0)
+            m5.metric("Needs Review", 0)
 
         # ── Corrections ───────────────────────────────────────────────────────
 
@@ -236,6 +238,24 @@ if run:
                         f"⚠ **{item['employee']}** · {date_str} · "
                         f"{item.get('note', 'needs review')}"
                     )
+
+        # ── Anomalies ─────────────────────────────────────────────────────────
+
+        if logs.get("anomalies"):
+            st.subheader("Schedule Anomalies")
+            st.caption(
+                "Hours are capped to the schedule. These flags show days where punches "
+                "went outside the schedule — review and add an exception in the notes "
+                "sheet for any day that should be paid over."
+            )
+            by_employee = defaultdict(list)
+            for item in logs["anomalies"]:
+                by_employee[item["employee"]].append(item)
+            for emp, items in by_employee.items():
+                with st.expander(f"⚠ {emp} — {len(items)} anomal{'y' if len(items) == 1 else 'ies'}"):
+                    for item in items:
+                        date_str = item["date"].strftime("%m/%d/%Y")
+                        st.warning(f"**{date_str}** · {item['description']}")
 
         # ── Review flags ──────────────────────────────────────────────────────
 

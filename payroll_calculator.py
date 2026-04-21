@@ -927,6 +927,7 @@ def initial_day_record(employee, work_date):
         "raw_entries": [],
         "raw_hours": 0.0,
         "raw_first_in": None,
+        "raw_last_out": None,
         "corrected_hours": None,
         "corrected_text": "",
         "corrected_start": None,
@@ -937,6 +938,7 @@ def initial_day_record(employee, work_date):
         "outside_description": "",
         "outside_approved": False,
         "special_adjustment": None,
+        "anomalies": [],
         "notes": [],
     }
 
@@ -954,6 +956,12 @@ def build_day_records(entries):
         in_time = entry.get("in_time_obj")
         if in_time and (record["raw_first_in"] is None or in_time < record["raw_first_in"]):
             record["raw_first_in"] = in_time
+
+        out_time = entry.get("out_time_obj")
+        if out_time:
+            adjusted_out = make_after(out_time, in_time) if in_time else out_time
+            if record["raw_last_out"] is None or adjusted_out > record["raw_last_out"]:
+                record["raw_last_out"] = adjusted_out
     return records
 
 
@@ -975,6 +983,7 @@ def apply_notes(entries, notes, rules):
         "corrections": [],
         "leave": [],
         "exceptions": [],
+        "anomalies": [],
         "review": list(notes.get("review_items", [])),
     }
 
@@ -1104,19 +1113,75 @@ def apply_notes(entries, notes, rules):
         if outside:
             approved_hours = outside.get("approved_hours")
             if approved_hours is not None:
-                # Use the exact hours Megha wrote — no schedule cap
+                # Use the exact hours Megha wrote — approved exception
                 final_work = approved_hours
                 record["notes"].append(f"Approved: {approved_hours:.2f} hrs")
             else:
-                # Approved but no explicit hours — pass through ADP uncapped
+                # Approved but no explicit hours — pass through ADP as-is
                 if outside.get("description"):
                     record["notes"].append(f"Approved exception: {outside['description']}")
-        elif rules.get("cap_to_schedule") and schedule_info:
-            if actual_hours > schedule_info["paid_hours"]:
-                record["notes"].append(
-                    f"Capped to schedule ({schedule_info['paid_hours']:.2f} hrs)"
+        elif schedule_info and actual_hours > 0:
+            # Cap paid hours to the schedule — overage only paid if Megha writes an exception.
+            # Still surface anomalies so she can see which days went over and decide.
+            scheduled_hours = schedule_info["paid_hours"]
+            sched_start = schedule_info.get("start")
+            sched_end = schedule_info.get("end")
+            last_out = record["raw_last_out"]
+
+            TOLERANCE = 0.25  # 15 min
+            WINDOW_TOLERANCE = timedelta(minutes=15)
+
+            if actual_hours > scheduled_hours + TOLERANCE:
+                delta = round(actual_hours - scheduled_hours, 2)
+                desc = (
+                    f"Worked {actual_hours:.2f} hrs — {delta:+.2f} over scheduled "
+                    f"{scheduled_hours:.2f} (capped; add an exception to pay full)"
                 )
-            final_work = min(actual_hours, schedule_info["paid_hours"])
+                record["anomalies"].append(desc)
+                logs["anomalies"].append({
+                    "employee": employee,
+                    "date": work_date,
+                    "type": "over_hours",
+                    "actual_hours": round(actual_hours, 2),
+                    "scheduled_hours": scheduled_hours,
+                    "description": desc,
+                })
+
+            if first_in and sched_start:
+                base = datetime(2000, 1, 1)
+                if datetime.combine(base, first_in) + WINDOW_TOLERANCE < datetime.combine(base, sched_start):
+                    desc = (
+                        f"Clocked in at {first_in.strftime('%I:%M %p').lstrip('0')} — "
+                        f"before scheduled start {sched_start.strftime('%I:%M %p').lstrip('0')}"
+                    )
+                    record["anomalies"].append(desc)
+                    logs["anomalies"].append({
+                        "employee": employee,
+                        "date": work_date,
+                        "type": "early_in",
+                        "description": desc,
+                    })
+
+            if last_out and sched_end:
+                base = datetime(2000, 1, 1)
+                if datetime.combine(base, last_out) > datetime.combine(base, sched_end) + WINDOW_TOLERANCE:
+                    desc = (
+                        f"Clocked out at {last_out.strftime('%I:%M %p').lstrip('0')} — "
+                        f"after scheduled end {sched_end.strftime('%I:%M %p').lstrip('0')}"
+                    )
+                    record["anomalies"].append(desc)
+                    logs["anomalies"].append({
+                        "employee": employee,
+                        "date": work_date,
+                        "type": "late_out",
+                        "description": desc,
+                    })
+
+            if actual_hours > scheduled_hours:
+                record["notes"].append(
+                    f"Capped to schedule ({scheduled_hours:.2f} hrs)"
+                )
+            final_work = min(actual_hours, scheduled_hours)
 
         if special_rule and work_date == special_rule.get("date"):
             status = cell_to_text(meta.get("status")).lower()
@@ -1329,7 +1394,17 @@ def write_excel(output_path, day_records, logs, leave_totals, employee_meta, pay
         sorted(day_records.values(), key=lambda item: (normalize_name(item["employee"]), item["date"])),
         start=2,
     ):
-        fill = FLAG_FILL if record["corrected_hours"] is not None or record["special_adjustment"] else None
+        has_anomaly = bool(record["anomalies"])
+        has_correction = record["corrected_hours"] is not None or record["special_adjustment"]
+        if has_anomaly:
+            fill = ERROR_FILL
+        elif has_correction:
+            fill = FLAG_FILL
+        else:
+            fill = None
+        combined_notes = list(record["notes"])
+        for anomaly in record["anomalies"]:
+            combined_notes.append(f"⚠ Anomaly: {anomaly}")
         write_cell(details, row_index, 1, record["employee"], fill=fill)
         write_cell(details, row_index, 2, record["date"].strftime("%m/%d/%Y"), fill=fill)
         write_cell(details, row_index, 3, record["date"].strftime("%a"), fill=fill)
@@ -1339,7 +1414,7 @@ def write_excel(output_path, day_records, logs, leave_totals, employee_meta, pay
         write_cell(details, row_index, 7, record["schedule_hours"], fill=fill, fmt="0.00")
         write_cell(details, row_index, 8, "YES" if record["outside_approved"] else "", fill=fill)
         write_cell(details, row_index, 9, record["final_work_hours"], fill=fill, fmt="0.00")
-        write_cell(details, row_index, 10, "\n".join(record["notes"]), fill=fill, wrap=True)
+        write_cell(details, row_index, 10, "\n".join(combined_notes), fill=fill, wrap=True)
 
     details.freeze_panes = "A2"
 
@@ -1391,6 +1466,21 @@ def write_excel(output_path, day_records, logs, leave_totals, employee_meta, pay
         write_cell(review, row, 2, item["date"].strftime("%m/%d/%Y"), fill=ALT_FILL)
         write_cell(review, row, 5, item["description"], fill=ALT_FILL, wrap=True)
         row += 1
+
+    if logs.get("anomalies"):
+        row += 1
+        hdr(review, row, 1, "Schedule Anomalies (paid per labor law, flagged for review)")
+        review.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        row += 1
+        for col, value in enumerate(["Employee", "Date", "Type", "", "Description"], start=1):
+            hdr(review, row, col, value, fill=SUB_FILL, font=SUB_FONT)
+        row += 1
+        for item in logs["anomalies"]:
+            write_cell(review, row, 1, item["employee"], fill=FLAG_FILL)
+            write_cell(review, row, 2, item["date"].strftime("%m/%d/%Y"), fill=FLAG_FILL)
+            write_cell(review, row, 3, item["type"], fill=FLAG_FILL)
+            write_cell(review, row, 5, item["description"], fill=FLAG_FILL, wrap=True)
+            row += 1
 
     if logs["review"]:
         row += 1
