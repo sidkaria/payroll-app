@@ -36,7 +36,7 @@ from openpyxl.utils import get_column_letter
 TIME_TOKEN_RE = re.compile(
     r"\d{1,2}:\d{2}\s*(?:[AaPp][Mm])?|\d{1,2}\s*(?:[AaPp][Mm])"
 )
-DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
+DATE_RE = re.compile(r"\d{1,2}/\d{1,2}(?:/\d{2,4})?")
 
 
 def parse_time(value):
@@ -214,7 +214,12 @@ def parse_date_value(value):
             return datetime.strptime(text, fmt).date()
         except ValueError:
             pass
-    return None
+    # Year-less form like "4/8" — default to the current year
+    try:
+        parsed = datetime.strptime(text, "%m/%d").date()
+        return parsed.replace(year=date.today().year)
+    except ValueError:
+        return None
 
 
 def expand_date_expression(value):
@@ -236,7 +241,7 @@ def expand_date_expression(value):
     results = []
     for line in split_nonempty_lines(text):
         line_matches = re.finditer(
-            r"(\d{1,2}/\d{1,2}/\d{2,4})(?:\s*-\s*(\d{1,2}/\d{1,2}/\d{2,4}))?",
+            r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?:\s*-\s*(\d{1,2}/\d{1,2}(?:/\d{2,4})?))?",
             line,
         )
         for match in line_matches:
@@ -402,6 +407,173 @@ def parse_schedule_override(description, fallback_break=0.0):
     return schedule_info_from_range(
         timerange["start"], timerange["end"], break_hours=break_hours, source_text=text
     )
+
+
+# ---------------------------------------------------------------------------
+# EXCEPTION TEXT PARSING
+# ---------------------------------------------------------------------------
+
+END_TIME_PHRASES = re.compile(
+    r"late\s*pickup|pay(?:ed|id)?\s*until|paid\s*until|stayed\s*(?:until|till)|"
+    r"worked\s*(?:until|till)|pickup\s*at|picked\s*up|left\s*at|clocked\s*out\s*at",
+    re.I,
+)
+START_TIME_PHRASES = re.compile(
+    r"came\s*in\s*(?:early|at)|started\s*(?:early|at)|clocked\s*in\s*at|in\s*at|"
+    r"arrived\s*at|early\s*(?:start|arrival)",
+    re.I,
+)
+BARE_RANGE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*(?:[-–]|to)\s*(\d{1,2})(?!\d)", re.I)
+
+
+def _extract_time_range(text):
+    """
+    Try to find two times forming a range. First strict (HH:MM or HH am/pm),
+    then fall back to bare N-M pattern (e.g. "Worked 7-4").
+    """
+    strict = parse_time_range(text)
+    if strict:
+        return strict
+
+    match = BARE_RANGE_RE.search(text)
+    if not match:
+        return None
+    start = parse_time(match.group(1))
+    end = parse_time(match.group(2))
+    if not start or not end:
+        return None
+    end = make_after(end, start)
+    duration = hours_between(start, end)
+    if duration <= 0 or duration > 14:
+        return None
+    return {"start": start, "end": end, "duration": duration}
+
+
+def _format_time(value):
+    return value.strftime("%I:%M %p").lstrip("0") if value else ""
+
+
+def parse_exception_text(description, schedule_info):
+    """
+    Interpret a free-text outside-schedule exception into paid hours.
+
+    Patterns tried in order:
+      1. Multi-segment schedule (4+ times, e.g. split shift like "8:30|1:00|2:00|6:00")
+      2. Time range (two times) → schedule override for the day
+      3. Single time + end-keyword ("late pickup X", "pay until X") → extend schedule end
+      4. Single time + start-keyword ("came in at X", "started X") → extend schedule start
+      5. Single time, no keyword → default to end-time extension (most common case)
+
+    Returns:
+      {"status": "parsed", "hours": float, "interpretation": str}
+      {"status": "unparseable", "interpretation": str}
+    """
+    text = (description or "").strip()
+    if not text:
+        return {"status": "unparseable", "interpretation": ""}
+
+    # Pattern 0: "pay hours worked" / "pay actual" / standalone "no break"
+    # → pay the raw ADP hours as-is (no cap, no break adjustment)
+    if re.search(
+        r"pay\s+(?:the\s+)?(?:hours?\s+)?(?:worked|actual)|^\s*no\s+break\s*$",
+        text,
+        re.I,
+    ) or re.search(r"pay\s+hours\s+worked", text, re.I):
+        return {
+            "status": "pay_actual",
+            "interpretation": "Pay actual hours worked (no schedule cap, no break)",
+        }
+
+    tokens = TIME_TOKEN_RE.findall(text)
+    parsed_times = [parsed for parsed in (parse_time(tok) for tok in tokens) if parsed]
+
+    # Pattern 1: multi-segment / split shift (4+ paired times)
+    # Gaps between segments are unpaid by construction — don't apply a break deduction.
+    if len(parsed_times) >= 4 and len(parsed_times) % 2 == 0:
+        total = 0.0
+        segments = []
+        for i in range(0, len(parsed_times), 2):
+            seg_start = parsed_times[i]
+            seg_end = make_after(parsed_times[i + 1], seg_start)
+            span = hours_between(seg_start, seg_end)
+            if span <= 0 or span > 14:
+                total = -1
+                break
+            total += span
+            segments.append((seg_start, seg_end))
+        if total > 0 and total <= 14:
+            total = round(total, 2)
+            segs_str = ", ".join(
+                f"{_format_time(s)}–{_format_time(e)}" for s, e in segments
+            )
+            return {
+                "status": "parsed",
+                "hours": total,
+                "interpretation": f"Split-shift {segs_str} = {total:.2f} hrs",
+            }
+
+    # Pattern 2: two times → schedule override
+    timerange = _extract_time_range(text)
+    if timerange:
+        break_hours = schedule_info.get("break_hours", 0.0) if schedule_info else 0.0
+        hours = round(max(0.0, timerange["duration"] - break_hours), 2)
+        if 0 < hours <= 14:
+            brk = f" − {break_hours:g}h break" if break_hours else ""
+            return {
+                "status": "parsed",
+                "hours": hours,
+                "interpretation": (
+                    f"Schedule override {_format_time(timerange['start'])}"
+                    f"–{_format_time(timerange['end'])}{brk} = {hours:.2f} hrs"
+                ),
+            }
+
+    # Single time + schedule → start-shift or end-extension
+    if schedule_info:
+        times = parsed_times
+
+        if len(times) == 1:
+            sched_start = schedule_info.get("start")
+            sched_end = schedule_info.get("end")
+            break_hours = schedule_info.get("break_hours", 0.0)
+            clock = times[0]
+
+            is_start = bool(START_TIME_PHRASES.search(text))
+            is_end = bool(END_TIME_PHRASES.search(text))
+
+            # Explicit start-shift keyword: treat as new start time
+            if is_start and not is_end and sched_end:
+                new_start = clock
+                duration = hours_between(new_start, sched_end)
+                if duration > 0:
+                    hours = round(max(0.0, duration - break_hours), 2)
+                    if 0 < hours <= 14:
+                        return {
+                            "status": "parsed",
+                            "hours": hours,
+                            "interpretation": (
+                                f"Started {_format_time(new_start)} (early) = {hours:.2f} hrs"
+                            ),
+                        }
+
+            # Default / end-keyword: extend end of shift to this time
+            if sched_start:
+                new_end = make_after(clock, sched_start)
+                duration = hours_between(sched_start, new_end)
+                if duration > 0:
+                    hours = round(max(0.0, duration - break_hours), 2)
+                    if 0 < hours <= 14:
+                        verb = "Extended end to" if is_end else "End at"
+                        return {
+                            "status": "parsed",
+                            "hours": hours,
+                            "interpretation": f"{verb} {_format_time(new_end)} = {hours:.2f} hrs",
+                        }
+
+    return {
+        "status": "unparseable",
+        "interpretation": f"Could not interpret: {text}",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -827,22 +999,27 @@ def parse_xlsx_notes(path):
         all_outside_dates = expand_date_expression(outside_dates_raw)
         if all_outside_dates:
             hours_lines = [ln.strip() for ln in cell_to_text(outside_hours_raw).splitlines() if ln.strip()]
+            whole_text = cell_to_text(outside_hours_raw).strip()
+
             if len(hours_lines) == len(all_outside_dates):
-                # Per-date hours: pair line by line
-                date_hours_pairs = [(d, parse_float(h)) for d, h in zip(all_outside_dates, hours_lines)]
+                # Per-date pairing: each date gets its own line as description + numeric attempt
+                date_entries = [
+                    (d, line, parse_float(line))
+                    for d, line in zip(all_outside_dates, hours_lines)
+                ]
             else:
-                # Consolidated total divided evenly across dates
+                # Counts don't match — fall back to whole-cell text for each date.
+                # Divide numeric total evenly if possible, else leave as None for text parsing.
                 total_hrs = parse_float(outside_hours_raw)
                 per_day = round(total_hrs / len(all_outside_dates), 4) if total_hrs else None
-                date_hours_pairs = [(d, per_day) for d in all_outside_dates]
+                date_entries = [(d, whole_text, per_day) for d in all_outside_dates]
 
-            outside_desc = cell_to_text(outside_hours_raw).strip()
-            for work_date, approved_hours in date_hours_pairs:
+            for work_date, description, approved_hours in date_entries:
                 notes["outside_schedule"].append(
                     {
                         "employee": employee,
                         "date": work_date,
-                        "description": outside_desc,
+                        "description": description,
                         "approved_hours": approved_hours,
                     }
                 )
@@ -1128,15 +1305,43 @@ def apply_notes(entries, notes, rules):
         final_work = actual_hours
         approved_hours = outside.get("approved_hours") if outside else None
 
+        # If no explicit number, try to interpret the description text
+        # (e.g. "Late pickup 6:37", "Schedule 7 AM - 4 PM", "Worked 7-4")
+        exception_parse = None
+        if approved_hours is None and outside and outside.get("description"):
+            exception_parse = parse_exception_text(outside["description"], schedule_info)
+
         if approved_hours is not None:
             # Megha wrote an explicit numeric hours value — pay that exactly
             final_work = approved_hours
             record["notes"].append(f"Approved: {approved_hours:.2f} hrs")
+        elif exception_parse and exception_parse["status"] == "parsed":
+            # Auto-interpreted a phrase like "Late pickup 6:37"
+            final_work = exception_parse["hours"]
+            record["notes"].append(
+                f"Approved exception — {exception_parse['interpretation']} "
+                f"(from: \"{outside['description']}\")"
+            )
+        elif exception_parse and exception_parse["status"] == "pay_actual":
+            # "Pay hours worked" / "no break" — use raw ADP hours, no cap
+            final_work = actual_hours
+            record["notes"].append(
+                f"Approved exception — {exception_parse['interpretation']} "
+                f"(from: \"{outside['description']}\")"
+            )
         else:
             if outside and outside.get("description"):
-                # Description only (no numeric hours) — treat as informational note,
-                # still cap to schedule. Megha will adjust manually if needed.
+                # Description only and we couldn't parse it — informational note + review flag
                 record["notes"].append(f"Note: {outside['description']}")
+                if exception_parse and exception_parse["status"] == "unparseable":
+                    logs["review"].append({
+                        "employee": employee,
+                        "date": work_date,
+                        "issue": (
+                            f"Exception note couldn't be auto-calculated "
+                            f"(paid at schedule): \"{outside['description']}\""
+                        ),
+                    })
             if schedule_info and actual_hours > 0:
                 # Cap paid hours to the schedule — overage only paid if Megha writes explicit approved hours.
                 # Surface anomalies so she can see which days went over and decide.
