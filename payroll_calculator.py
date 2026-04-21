@@ -1091,6 +1091,22 @@ def apply_notes(entries, notes, rules):
                 continue
             get_or_create_day(day_records, employee, special_rule["date"])
 
+    # Flag employees with punches but no schedule in notes — they can't be capped.
+    flagged_no_schedule = set()
+    for (employee, _), record in day_records.items():
+        if employee in flagged_no_schedule:
+            continue
+        meta = employee_meta.get(employee)
+        has_schedule = meta and meta.get("schedule", {}).get("mode") == "scheduled"
+        has_punches = any(r["raw_hours"] > 0 for (e, _), r in day_records.items() if e == employee)
+        if not has_schedule and has_punches:
+            flagged_no_schedule.add(employee)
+            logs["review"].append({
+                "employee": employee,
+                "date": "",
+                "issue": "No schedule found in notes — hours not capped. Add this employee to the notes sheet or adjust manually.",
+            })
+
     for key, record in day_records.items():
         employee = record["employee"]
         work_date = record["date"]
@@ -1110,78 +1126,79 @@ def apply_notes(entries, notes, rules):
             record["schedule_label"] = schedule_info["label"]
 
         final_work = actual_hours
-        if outside:
-            approved_hours = outside.get("approved_hours")
-            if approved_hours is not None:
-                # Use the exact hours Megha wrote — approved exception
-                final_work = approved_hours
-                record["notes"].append(f"Approved: {approved_hours:.2f} hrs")
-            else:
-                # Approved but no explicit hours — pass through ADP as-is
-                if outside.get("description"):
-                    record["notes"].append(f"Approved exception: {outside['description']}")
-        elif schedule_info and actual_hours > 0:
-            # Cap paid hours to the schedule — overage only paid if Megha writes an exception.
-            # Still surface anomalies so she can see which days went over and decide.
-            scheduled_hours = schedule_info["paid_hours"]
-            sched_start = schedule_info.get("start")
-            sched_end = schedule_info.get("end")
-            last_out = record["raw_last_out"]
+        approved_hours = outside.get("approved_hours") if outside else None
 
-            TOLERANCE = 0.25  # 15 min
-            WINDOW_TOLERANCE = timedelta(minutes=15)
+        if approved_hours is not None:
+            # Megha wrote an explicit numeric hours value — pay that exactly
+            final_work = approved_hours
+            record["notes"].append(f"Approved: {approved_hours:.2f} hrs")
+        else:
+            if outside and outside.get("description"):
+                # Description only (no numeric hours) — treat as informational note,
+                # still cap to schedule. Megha will adjust manually if needed.
+                record["notes"].append(f"Note: {outside['description']}")
+            if schedule_info and actual_hours > 0:
+                # Cap paid hours to the schedule — overage only paid if Megha writes explicit approved hours.
+                # Surface anomalies so she can see which days went over and decide.
+                scheduled_hours = schedule_info["paid_hours"]
+                sched_start = schedule_info.get("start")
+                sched_end = schedule_info.get("end")
+                last_out = record["raw_last_out"]
 
-            if actual_hours > scheduled_hours + TOLERANCE:
-                delta = round(actual_hours - scheduled_hours, 2)
-                desc = (
-                    f"Worked {actual_hours:.2f} hrs — {delta:+.2f} over scheduled "
-                    f"{scheduled_hours:.2f} (capped; add an exception to pay full)"
-                )
-                record["anomalies"].append(desc)
-                logs["anomalies"].append({
-                    "employee": employee,
-                    "date": work_date,
-                    "type": "over_hours",
-                    "actual_hours": round(actual_hours, 2),
-                    "scheduled_hours": scheduled_hours,
-                    "description": desc,
-                })
+                TOLERANCE = 0.25  # 15 min
+                WINDOW_TOLERANCE = timedelta(minutes=15)
 
-            if first_in and sched_start:
-                base = datetime(2000, 1, 1)
-                if datetime.combine(base, first_in) + WINDOW_TOLERANCE < datetime.combine(base, sched_start):
+                if actual_hours > scheduled_hours + TOLERANCE:
+                    delta = round(actual_hours - scheduled_hours, 2)
                     desc = (
-                        f"Clocked in at {first_in.strftime('%I:%M %p').lstrip('0')} — "
-                        f"before scheduled start {sched_start.strftime('%I:%M %p').lstrip('0')}"
+                        f"Worked {actual_hours:.2f} hrs — {delta:+.2f} over scheduled "
+                        f"{scheduled_hours:.2f} (capped; add an exception to pay full)"
                     )
                     record["anomalies"].append(desc)
                     logs["anomalies"].append({
                         "employee": employee,
                         "date": work_date,
-                        "type": "early_in",
+                        "type": "over_hours",
+                        "actual_hours": round(actual_hours, 2),
+                        "scheduled_hours": scheduled_hours,
                         "description": desc,
                     })
 
-            if last_out and sched_end:
-                base = datetime(2000, 1, 1)
-                if datetime.combine(base, last_out) > datetime.combine(base, sched_end) + WINDOW_TOLERANCE:
-                    desc = (
-                        f"Clocked out at {last_out.strftime('%I:%M %p').lstrip('0')} — "
-                        f"after scheduled end {sched_end.strftime('%I:%M %p').lstrip('0')}"
+                if first_in and sched_start:
+                    base = datetime(2000, 1, 1)
+                    if datetime.combine(base, first_in) + WINDOW_TOLERANCE < datetime.combine(base, sched_start):
+                        desc = (
+                            f"Clocked in at {first_in.strftime('%I:%M %p').lstrip('0')} — "
+                            f"before scheduled start {sched_start.strftime('%I:%M %p').lstrip('0')}"
+                        )
+                        record["anomalies"].append(desc)
+                        logs["anomalies"].append({
+                            "employee": employee,
+                            "date": work_date,
+                            "type": "early_in",
+                            "description": desc,
+                        })
+
+                if last_out and sched_end:
+                    base = datetime(2000, 1, 1)
+                    if datetime.combine(base, last_out) > datetime.combine(base, sched_end) + WINDOW_TOLERANCE:
+                        desc = (
+                            f"Clocked out at {last_out.strftime('%I:%M %p').lstrip('0')} — "
+                            f"after scheduled end {sched_end.strftime('%I:%M %p').lstrip('0')}"
+                        )
+                        record["anomalies"].append(desc)
+                        logs["anomalies"].append({
+                            "employee": employee,
+                            "date": work_date,
+                            "type": "late_out",
+                            "description": desc,
+                        })
+
+                if actual_hours > scheduled_hours:
+                    record["notes"].append(
+                        f"Capped to schedule ({scheduled_hours:.2f} hrs)"
                     )
-                    record["anomalies"].append(desc)
-                    logs["anomalies"].append({
-                        "employee": employee,
-                        "date": work_date,
-                        "type": "late_out",
-                        "description": desc,
-                    })
-
-            if actual_hours > scheduled_hours:
-                record["notes"].append(
-                    f"Capped to schedule ({scheduled_hours:.2f} hrs)"
-                )
-            final_work = min(actual_hours, scheduled_hours)
+                final_work = min(actual_hours, scheduled_hours)
 
         if special_rule and work_date == special_rule.get("date"):
             status = cell_to_text(meta.get("status")).lower()
