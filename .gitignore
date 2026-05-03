@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Real payroll data — never commit. The test suite uses synthetic fixtures
+# in tests/fixtures.py instead. If you want a sample to develop against,
+# scrub names + numbers before saving anywhere outside this repo.
+*.csv
+*.xlsx
+*.xlsm
+*.docx
+samples/
+fixtures_real/
+
+# OS
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml

@@ -484,6 +484,11 @@ def parse_exception_text(description, schedule_info):
             "interpretation": "Pay actual hours worked (no schedule cap, no break)",
         }
 
+    # If the description says "no break" alongside other content (times,
+    # keywords, etc.), suppress the break deduction in the patterns below.
+    # Standalone "no break" is already handled by Pattern 0 above.
+    no_break_override = bool(re.search(r"\bno\s+break\b", text, re.I))
+
     tokens = TIME_TOKEN_RE.findall(text)
     parsed_times = [parsed for parsed in (parse_time(tok) for tok in tokens) if parsed]
 
@@ -515,10 +520,16 @@ def parse_exception_text(description, schedule_info):
     # Pattern 2: two times → schedule override
     timerange = _extract_time_range(text)
     if timerange:
-        break_hours = schedule_info.get("break_hours", 0.0) if schedule_info else 0.0
+        sched_break = schedule_info.get("break_hours", 0.0) if schedule_info else 0.0
+        break_hours = 0.0 if no_break_override else sched_break
         hours = round(max(0.0, timerange["duration"] - break_hours), 2)
         if 0 < hours <= 14:
-            brk = f" − {break_hours:g}h break" if break_hours else ""
+            if break_hours:
+                brk = f" − {break_hours:g}h break"
+            elif no_break_override and sched_break:
+                brk = " (no break)"
+            else:
+                brk = ""
             return {
                 "status": "parsed",
                 "hours": hours,
@@ -535,7 +546,8 @@ def parse_exception_text(description, schedule_info):
         if len(times) == 1:
             sched_start = schedule_info.get("start")
             sched_end = schedule_info.get("end")
-            break_hours = schedule_info.get("break_hours", 0.0)
+            sched_break = schedule_info.get("break_hours", 0.0)
+            break_hours = 0.0 if no_break_override else sched_break
             clock = times[0]
 
             is_start = bool(START_TIME_PHRASES.search(text))
