@@ -143,3 +143,18 @@ streamlit run app.py
 Streamlit Community Cloud, deployed from the `main` branch of the
 GitHub repo `sidkaria/payroll-app`. Pushes to `main` redeploy
 automatically; Megha gets the new behavior on her next page load.
+
+
+## Work tracking
+
+Work for this repo is tracked in `.backlog/` — one markdown file per task
+(`status`, `priority`, `depends_on`, `needs_keys`). `ROADMAP.md` is a generated
+view (`node tools/task render`); never hand-edit it.
+
+- User shares an idea → invoke the `capture-idea` skill (files it in `.backlog/`).
+- User says "implement X" / "what's next" → invoke `focus-task`
+  (`node tools/task next` → build → `./check.sh` → commit → push to main).
+- `./check.sh` must exit 0 before any push; never edit it to pass.
+
+`.backlog/` + `tools/task` + `check.sh` are the contract any external automation
+consumes — the repo doesn't need to know what's driving it.

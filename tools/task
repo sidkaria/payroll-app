@@ -1,0 +1,288 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * sula-task — the Sula backlog tool.
+ *
+ * The backlog is one markdown file per task under .backlog/<ID>.md with
+ * YAML-ish frontmatter. This CLI is the ONLY thing that picks "what to work on
+ * next" — deterministically, not by LLM judgement. ROADMAP.md is a generated
+ * VIEW (see `render`), never hand-edited.
+ *
+ * Commands:
+ *   next            print the ID of the next actionable task (or nothing)
+ *   list [status]   human-readable listing, optionally filtered by status
+ *   show <id>       print one task file
+ *   done <id>       set a task's status to done
+ *   set <id> <k> <v>  set a frontmatter field (status, priority, ...)
+ *   render          regenerate ROADMAP.md from the backlog
+ *   validate        exit non-zero if any task frontmatter is malformed
+ *
+ * Zero dependencies — runs under the node already on the machine.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const REPO = path.resolve(__dirname, '..');
+const BACKLOG = path.join(REPO, '.backlog');
+const ROADMAP = path.join(REPO, 'ROADMAP.md');
+const HISTORY = path.join(BACKLOG, 'HISTORY.md');
+const KEYS_FILE = path.join(REPO, '.backlog', 'keys.available');
+
+const STATUSES = ['idea', 'scoped', 'ready', 'in_progress', 'blocked', 'done'];
+const PRIORITIES = ['P0', 'P1', 'P2'];
+const REQUIRED = ['id', 'title', 'status', 'priority', 'tier'];
+
+// ── frontmatter ────────────────────────────────────────────────────────────
+function parseTask(file) {
+  const raw = fs.readFileSync(file, 'utf8');
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!m) return { _file: file, _error: 'no frontmatter block' };
+  const fm = { _file: file, _body: m[2].trim() };
+  for (const line of m[1].split('\n')) {
+    if (!line.trim()) continue;
+    const mm = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
+    if (!mm) continue;
+    let [, k, v] = mm;
+    v = v.trim();
+    if (v.startsWith('[') && v.endsWith(']')) {
+      v = v.slice(1, -1).split(',').map((s) => s.trim()).filter(Boolean);
+    }
+    fm[k] = v;
+  }
+  return fm;
+}
+
+function loadAll() {
+  if (!fs.existsSync(BACKLOG)) return [];
+  return fs
+    .readdirSync(BACKLOG)
+    .filter((f) => f.endsWith('.md') && !['HISTORY.md', 'ARCHITECTURE.md'].includes(f))
+    .map((f) => parseTask(path.join(BACKLOG, f)))
+    .filter((t) => !t._error || (console.error(`malformed: ${t._file} — ${t._error}`), false));
+}
+
+function availableKeys() {
+  const fromEnv = Object.keys(process.env);
+  if (!fs.existsSync(KEYS_FILE)) return new Set(fromEnv);
+  const fromFile = fs.readFileSync(KEYS_FILE, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean);
+  return new Set([...fromEnv, ...fromFile]);
+}
+
+function arr(v) {
+  return Array.isArray(v) ? v : v ? [v] : [];
+}
+
+// ── selection ──────────────────────────────────────────────────────────────
+function pickNext(tasks) {
+  const done = new Set(tasks.filter((t) => t.status === 'done').map((t) => t.id));
+  const keys = availableKeys();
+  const inProgress = tasks.filter((t) => t.status === 'in_progress');
+  if (inProgress.length) return inProgress[0]; // resume an interrupted task first
+  const ready = tasks.filter((t) => {
+    if (t.status !== 'ready') return false;
+    if (!arr(t.depends_on).every((d) => done.has(d))) return false;
+    if (!arr(t.needs_keys).every((k) => keys.has(k))) return false;
+    return true;
+  });
+  ready.sort((a, b) => {
+    const p = PRIORITIES.indexOf(a.priority) - PRIORITIES.indexOf(b.priority);
+    return p !== 0 ? p : a.id.localeCompare(b.id);
+  });
+  return ready[0] || null;
+}
+
+// ── commands ───────────────────────────────────────────────────────────────
+function cmdNext() {
+  const t = pickNext(loadAll());
+  if (t) process.stdout.write(t.id + '\n');
+}
+
+// ANSI — only when writing to a terminal.
+const TTY = process.stdout.isTTY;
+const C = (code) => (s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const c = {
+  dim: C('2'), bold: C('1'),
+  red: C('31'), grn: C('32'), yel: C('33'), cyn: C('36'), mag: C('35'),
+  redbg: C('41;97;1'), grnbg: C('42;30;1'), yelbg: C('43;30;1'),
+};
+const STATUS_STYLE = {
+  ready: { c: c.grn, label: 'READY' },
+  in_progress: { c: c.cyn, label: 'IN PROGRESS' },
+  blocked: { c: c.red, label: 'BLOCKED' },
+  scoped: { c: c.yel, label: 'SCOPED' },
+  idea: { c: c.dim, label: 'IDEAS' },
+  done: { c: c.dim, label: 'DONE' },
+};
+function prioBadge(p) {
+  if (p === 'P0') return c.redbg(' P0 ');
+  if (p === 'P1') return c.yelbg(' P1 ');
+  return c.dim(' P2 ');
+}
+
+function cmdList(status) {
+  const tasks = loadAll();
+  const done = new Set(tasks.filter((t) => t.status === 'done').map((t) => t.id));
+  const groups = {};
+  for (const t of tasks) (groups[t.status] = groups[t.status] || []).push(t);
+  for (const s of STATUSES) {
+    if (status && s !== status) continue;
+    const g = (groups[s] || []).sort((a, b) => {
+      const p = PRIORITIES.indexOf(a.priority) - PRIORITIES.indexOf(b.priority);
+      return p !== 0 ? p : a.id.localeCompare(b.id);
+    });
+    if (!g.length) continue;
+    const st = STATUS_STYLE[s];
+    console.log('');
+    console.log('  ' + st.c(c.bold(`${st.label}`)) + c.dim(`  ·  ${g.length}`));
+    console.log('  ' + c.dim('─'.repeat(34)));
+    for (const t of g) {
+      const deps = arr(t.depends_on);
+      const keys = arr(t.needs_keys);
+      const unmetDep = deps.some((d) => !done.has(d));
+      const chips = [];
+      if (deps.length) {
+        chips.push((unmetDep ? c.yel : c.dim)(`↳ ${deps.join(' ')}`));
+      }
+      if (keys.length) chips.push(c.mag(`🔑 ${keys.join(' ')}`));
+      const chipStr = chips.length ? '  ' + chips.join('  ') : '';
+      console.log(
+        `  ${c.dim(t.id)}  ${prioBadge(t.priority)}  ${c.bold(t.title)}${chipStr}`,
+      );
+    }
+  }
+  console.log('');
+}
+
+function cmdJson() {
+  const out = loadAll().map((t) => ({
+    id: t.id, title: t.title, status: t.status, priority: t.priority,
+    tier: t.tier, depends_on: arr(t.depends_on), needs_keys: arr(t.needs_keys),
+    tags: arr(t.tags), created: t.created || '',
+  }));
+  process.stdout.write(JSON.stringify(out) + '\n');
+}
+
+function findFile(id) {
+  const f = path.join(BACKLOG, `${id}.md`);
+  if (!fs.existsSync(f)) {
+    console.error(`no task ${id}`);
+    process.exit(1);
+  }
+  return f;
+}
+
+function cmdShow(id) {
+  process.stdout.write(fs.readFileSync(findFile(id), 'utf8'));
+}
+
+function cmdSet(id, key, value) {
+  const f = findFile(id);
+  let raw = fs.readFileSync(f, 'utf8');
+  const re = new RegExp(`^(${key}:).*$`, 'm');
+  if (re.test(raw)) raw = raw.replace(re, `$1 ${value}`);
+  else raw = raw.replace(/^---\n/, `---\n${key}: ${value}\n`);
+  fs.writeFileSync(f, raw);
+  console.log(`${id}: ${key} = ${value}`);
+}
+
+function cmdValidate() {
+  let bad = 0;
+  const ids = new Set();
+  for (const t of loadAll()) {
+    const base = path.basename(t._file);
+    for (const r of REQUIRED) {
+      if (!t[r]) { console.error(`${base}: missing '${r}'`); bad++; }
+    }
+    if (t.status && !STATUSES.includes(t.status)) { console.error(`${base}: bad status '${t.status}'`); bad++; }
+    if (t.priority && !PRIORITIES.includes(t.priority)) { console.error(`${base}: bad priority '${t.priority}'`); bad++; }
+    if (t.id && base !== `${t.id}.md`) { console.error(`${base}: filename != id '${t.id}'`); bad++; }
+    if (t.id && ids.has(t.id)) { console.error(`${base}: duplicate id '${t.id}'`); bad++; }
+    if (t.id) ids.add(t.id);
+  }
+  if (bad) { console.error(`sula-task validate: ${bad} problem(s)`); process.exit(1); }
+  console.log(`sula-task validate: ${ids.size} task(s) OK`);
+}
+
+function cmdDone(id) {
+  cmdSet(id, 'status', 'done');
+}
+
+function renderGroup(tasks, status) {
+  const g = tasks.filter((t) => t.status === status).sort((a, b) => {
+    const p = PRIORITIES.indexOf(a.priority) - PRIORITIES.indexOf(b.priority);
+    return p !== 0 ? p : a.id.localeCompare(b.id);
+  });
+  if (!g.length) return '';
+  return g.map((t) => {
+    const dep = arr(t.depends_on).length ? `  ·  deps: ${arr(t.depends_on).join(', ')}` : '';
+    const key = arr(t.needs_keys).length ? `  ·  needs: ${arr(t.needs_keys).join(', ')}` : '';
+    return `- \`${t.id}\` **${t.title}** — ${t.tier} / ${t.priority}${dep}${key}`;
+  }).join('\n') + '\n';
+}
+
+function cmdRender() {
+  const tasks = loadAll();
+  const next = pickNext(tasks);
+  const counts = {};
+  for (const t of tasks) counts[t.status] = (counts[t.status] || 0) + 1;
+  const out = [];
+  out.push('---');
+  out.push('purpose: GENERATED VIEW of the .backlog/ task files. Do not hand-edit — run `tools/sula-task render`.');
+  out.push('status: generated');
+  out.push(`last_updated: ${new Date().toISOString().slice(0, 10)}`);
+  out.push('---');
+  out.push('');
+  out.push('# ROADMAP');
+  out.push('');
+  out.push('**Generated** by `tools/sula-task render` from `.backlog/*.md`. Edit task');
+  out.push('files (or use `capture-idea` / the grooming job), never this file. MVP target ~2026-06-05.');
+  out.push('');
+  out.push('| Status | Count |');
+  out.push('|---|---|');
+  for (const s of STATUSES) out.push(`| ${s} | ${counts[s] || 0} |`);
+  out.push('');
+  out.push(`**Heartbeat picks next:** ${next ? '`' + next.id + '` — ' + next.title : '_(nothing ready — grooming needed)_'}`);
+  out.push('');
+  const sections = [
+    ['in_progress', 'In progress'],
+    ['ready', 'Ready — heartbeat works these top-down (priority, then id)'],
+    ['blocked', 'Blocked — waiting on keys or dependencies'],
+    ['scoped', 'Scoped — needs grooming to reach `ready`'],
+    ['idea', 'Ideas — captured, not yet scoped'],
+    ['done', 'Done'],
+  ];
+  for (const [status, heading] of sections) {
+    const body = renderGroup(tasks, status);
+    if (!body) continue;
+    out.push(`## ${heading}`);
+    out.push('');
+    out.push(body);
+  }
+  if (fs.existsSync(HISTORY)) {
+    out.push('## Done — earlier (pre-backlog archive)');
+    out.push('');
+    out.push(fs.readFileSync(HISTORY, 'utf8').trim());
+    out.push('');
+  }
+  fs.writeFileSync(ROADMAP, out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n');
+  console.log(`ROADMAP.md rendered — ${tasks.length} task(s), next: ${next ? next.id : '(none)'}`);
+}
+
+// ── dispatch ───────────────────────────────────────────────────────────────
+const [cmd, ...args] = process.argv.slice(2);
+const commands = {
+  next: cmdNext,
+  list: () => cmdList(args[0]),
+  json: cmdJson,
+  show: () => cmdShow(args[0]),
+  done: () => cmdDone(args[0]),
+  set: () => cmdSet(args[0], args[1], args.slice(2).join(' ')),
+  render: cmdRender,
+  validate: cmdValidate,
+};
+if (!commands[cmd]) {
+  console.error('usage: sula-task next|list|json|show|done|set|render|validate');
+  process.exit(2);
+}
+commands[cmd]();

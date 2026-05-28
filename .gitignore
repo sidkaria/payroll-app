@@ -21,3 +21,13 @@ fixtures_real/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# heartbeat / backlog
+.backlog/keys.available
+*.g.dart
+*.freezed.dart
+src/generated/
+.env
+.env.*
+*.pem
+*.key
