@@ -52,17 +52,38 @@ ADP CSVs and notes XLSX files in temp dirs with placeholder names like
 The behaviors below have flip-flopped at least once during development —
 each is now pinned by an integration test in `tests/test_apply_notes.py`.
 
-### Cap to schedule (default)
+### Cap to scheduled window (default)
 
-Paid work hours are capped to the scheduled paid hours
-(`min(actual, scheduled)`). Overage is **not** paid unless an exception
-is recorded. This is Megha's explicit preference (2026-04-21): "Keep the
-cap. I will fix the approved time manually."
+Paid work hours are capped to the **scheduled window**, not just the daily
+total. On a day the employee worked at least a full day's hours
+(`actual >= scheduled`), pay is the overlap of the actual punches with the
+scheduled time range, minus the **full** scheduled break:
+
+```
+paid = (min(last_out, sched_end) − max(first_in, sched_start)) − full_break
+final = min(actual, paid)          # never above the plain cap
+```
+
+A **5-minute grace** is applied on each edge (`LATE_GRACE`), so trivial clock
+drift isn't docked, but anything beyond is. The key consequence (Megha,
+2026-06-15): a **late arrival or early departure can't be recovered** by
+staying late, coming in early, or taking a shorter break than scheduled — and
+the full break is always deducted even if a shorter one was taken. The logic
+lives in `paid_within_schedule()`.
+
+This only fires on full-day records. On a **genuine short day**
+(`actual < scheduled`) we keep paying actual (`min(actual, scheduled)`), so we
+never deduct a break that wasn't taken or dock honest partial hours.
+**Missed-punch–corrected days** keep the plain `min(actual, scheduled)` cap,
+since their raw punches are incomplete by definition. Overage above schedule
+is still **not** paid unless an exception is recorded — Megha's earlier
+preference (2026-04-21): "Keep the cap. I will fix the approved time manually."
 
 When actual > scheduled + 15 min, an anomaly is logged in
 `logs["anomalies"]` and surfaced under "Schedule Anomalies" in the UI,
 but it does not change paid hours. Same for clock-in-early and
-clock-out-late anomalies (15-min tolerance).
+clock-out-late anomalies (15-min tolerance). These anomaly thresholds are
+independent of the 5-min pay grace above.
 
 ### Approved exceptions (override the cap)
 

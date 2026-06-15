@@ -103,6 +103,129 @@ class CapToScheduleTests(unittest.TestCase):
         self.assertAlmostEqual(rec["final_work_hours"], 7.0)
 
 
+class CapToScheduledWindowTests(unittest.TestCase):
+    """Megha's request (2026-06-15): a late arrival made up by staying late or
+    taking a shorter break must NOT yield the full scheduled hours. Pay is
+    clamped to the overlap of actual punches with the scheduled window, minus
+    the FULL scheduled break, with a 5-minute grace on each edge."""
+
+    SCHED = "8:00 am - 5:00 pm"   # 9h span − 1h break = 8h paid
+
+    def _row(self):
+        return NoteRow(name="Doe, Jane", schedule=self.SCHED, break_time="1 hour break")
+
+    def test_late_arrival_not_recovered_by_staying_late(self):
+        # Megha's canonical case. In 8:15, out 5:15, single punch = 9h actual.
+        # Window 8:15→5:00 = 8.75h, − 1h break = 7.75h (NOT 8.0).
+        entries = [AdpEntry("Doe, Jane", "4/7/2026", "8:15 AM", "5:15 PM", 9.0)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/7/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 7.75)
+
+    def test_short_break_with_late_start_is_capped(self):
+        # In 8:30 (30 min late), 30-min clocked break, out 5:00 → 8.0h actual.
+        # Window 8:30→5:00 = 8.5h − 1h FULL break = 7.5h (short break ignored).
+        entries = [
+            AdpEntry("Doe, Jane", "4/8/2026", "8:30 AM", "12:00 PM", 3.5),
+            AdpEntry("Doe, Jane", "4/8/2026", "12:30 PM", "5:00 PM", 4.5),
+        ]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/8/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 7.5)
+
+    def test_early_departure_is_docked(self):
+        # In 8:00, out 4:30 (30 min early), single punch = 8.5h actual.
+        # Window 8:00→4:30 = 8.5h − 1h break = 7.5h.
+        entries = [AdpEntry("Doe, Jane", "4/9/2026", "8:00 AM", "4:30 PM", 8.5)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/9/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 7.5)
+
+    def test_lateness_beyond_grace_is_docked(self):
+        # In 8:06 (6 min late > 5-min grace), out 5:00, single punch = 8.9h.
+        # Window 8:06→5:00 = 8.9h − 1h break = 7.9h.
+        entries = [AdpEntry("Doe, Jane", "4/10/2026", "8:06 AM", "5:00 PM", 8.9)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/10/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 7.9)
+
+    def test_small_lateness_within_grace_not_docked(self):
+        # In 8:04 (4 min late ≤ 5-min grace), out 5:04 (stayed late, clamped).
+        # Window treated as 8:00→5:00 = 9h − 1h break = 8.0h (full pay).
+        entries = [AdpEntry("Doe, Jane", "4/13/2026", "8:04 AM", "5:04 PM", 9.0)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/13/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 8.0)
+
+    def test_partial_day_keeps_actual_no_phantom_break(self):
+        # Worked an afternoon only: in 2:00 PM, out 5:00 PM = 3h actual, which
+        # is well under the 8h schedule. Pay actual 3h — must NOT deduct a full
+        # break the employee never took (would underpay to 2h).
+        entries = [AdpEntry("Doe, Jane", "4/14/2026", "2:00 PM", "5:00 PM", 3.0)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/14/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 3.0)
+
+    def test_perfect_attendance_still_pays_full_schedule(self):
+        # On time, leaves on time, no clocked break (single punch) = 9h actual.
+        # Window 8:00→5:00 = 9h − 1h break = 8.0h. No reduction for a clean day.
+        entries = [AdpEntry("Doe, Jane", "4/15/2026", "8:00 AM", "5:00 PM", 9.0)]
+        _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
+        rec = find_record(day_records, "Doe, Jane", "4/15/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 8.0)
+
+
+class OverrideBeatsWindowCapTests(unittest.TestCase):
+    """Megha's follow-up (2026-06-15): the scheduled-window cap must still be
+    overridable. When she records an approved exception (pay-actual, late
+    pickup, schedule change, split shift, or an explicit number), it is honored
+    in FULL — even above the cap — exactly as before. The window cap only
+    applies to days with NO recorded exception."""
+
+    SCHED = "8:00 am - 5:00 pm"   # 9h span − 1h break = 8h paid
+
+    def _row(self, **kw):
+        return NoteRow(name="Doe, Jane", schedule=self.SCHED,
+                       break_time="1 hour break", **kw)
+
+    def test_pay_hours_worked_override_beats_window_cap(self):
+        # Late arrival 8:30 + stayed to 6:00 = 9.5h raw. The cap alone would dock
+        # this to 7.5h, but an approved "pay hours worked" pays the full 9.5h.
+        entries = [AdpEntry("Doe, Jane", "4/8/2026", "8:30 AM", "6:00 PM", 9.5)]
+        rows = [self._row(outside_date="4/8/2026", outside_desc="Pay hours worked")]
+        _, _, day_records, _, _ = run_pipeline(entries, rows)
+        rec = find_record(day_records, "Doe, Jane", "4/8/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 9.5)
+
+    def test_late_pickup_override_beats_window_cap(self):
+        # On time, stayed to 6:30 for an approved late pickup. The cap would clamp
+        # the late stay back to 5:00 (→8.0); the override extends end to 6:30.
+        entries = [AdpEntry("Doe, Jane", "4/8/2026", "8:00 AM", "6:30 PM", 10.5)]
+        rows = [self._row(outside_date="4/8/2026", outside_desc="Late pickup 6:30 PM")]
+        _, _, day_records, _, _ = run_pipeline(entries, rows)
+        rec = find_record(day_records, "Doe, Jane", "4/8/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 9.5)  # 8:00–6:30 − 1h break
+
+    def test_numeric_approved_hours_override_beats_window_cap(self):
+        # Late arrival 8:30 would be docked to 7.5 by the cap, but Megha wrote an
+        # explicit approved 9.0 in the Hours cell → pay exactly 9.0.
+        entries = [AdpEntry("Doe, Jane", "4/8/2026", "8:30 AM", "6:00 PM", 9.5)]
+        rows = [self._row(outside_date="4/8/2026", outside_desc="9")]
+        _, _, day_records, _, _ = run_pipeline(entries, rows)
+        rec = find_record(day_records, "Doe, Jane", "4/8/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 9.0)
+
+    def test_no_break_override_skips_break_over_cap(self):
+        # "Worked without a break" (director approved): pay the full window with
+        # NO break deduction, even though the standard rule would deduct 1h.
+        entries = [AdpEntry("Doe, Jane", "4/8/2026", "8:00 AM", "5:00 PM", 9.0)]
+        rows = [self._row(outside_date="4/8/2026",
+                          outside_desc="8:00 AM - 5:00 PM no break")]
+        _, _, day_records, _, _ = run_pipeline(entries, rows)
+        rec = find_record(day_records, "Doe, Jane", "4/8/2026")
+        self.assertAlmostEqual(rec["final_work_hours"], 9.0)
+
+
 class ExceptionPassThroughTests(unittest.TestCase):
     def test_late_pickup_extends_end_time(self):
         entries = [

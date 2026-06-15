@@ -1161,6 +1161,48 @@ def get_or_create_day(records, employee, work_date):
     return records[key]
 
 
+# Lateness/early-departure shorter than this is forgiven (trivial clock drift).
+# Anything longer is docked. Megha's preference (2026-06-15): 5-minute grace.
+LATE_GRACE = timedelta(minutes=5)
+
+
+def paid_within_schedule(first_in, last_out, sched_start, sched_end,
+                         break_hours, grace=LATE_GRACE):
+    """Hours paid when capping the actual punches to the scheduled window.
+
+    Implements Megha's rule (2026-06-15): a late arrival or early departure
+    must NOT be recovered by staying late, coming in early, or taking a shorter
+    break. The worked window is clamped to [sched_start, sched_end], up to
+    `grace` minutes of lateness / early-departure is forgiven on each edge, and
+    then the FULL scheduled break is deducted regardless of the break actually
+    taken.
+
+    Returns the paid hours, or None when it can't be computed (a punch is
+    missing, or the punches don't overlap the scheduled window at all) so the
+    caller can fall back to the plain min(actual, scheduled) cap.
+    """
+    if not (first_in and last_out and sched_start and sched_end):
+        return None
+
+    base = datetime(2000, 1, 1)
+    fi = datetime.combine(base, first_in)
+    lo = datetime.combine(base, last_out)
+    ss = datetime.combine(base, sched_start)
+    se = datetime.combine(base, sched_end)
+
+    # Start edge: forgive lateness within grace; never pay for arriving early.
+    eff_start = fi if (fi - ss) > grace else ss
+    eff_start = max(eff_start, ss)
+    # End edge: forgive early departure within grace; never pay past schedule.
+    eff_end = lo if (se - lo) > grace else se
+    eff_end = min(eff_end, se)
+
+    window = (eff_end - eff_start).total_seconds() / 3600
+    if window <= 0:
+        return None
+    return round(max(0.0, window - break_hours), 2)
+
+
 def apply_notes(entries, notes, rules):
     employee_names = {entry["employee"] for entry in entries}
     employee_names.update(notes.get("employees", {}).keys())
@@ -1411,11 +1453,43 @@ def apply_notes(entries, notes, rules):
                             "description": desc,
                         })
 
-                if actual_hours > scheduled_hours:
-                    record["notes"].append(
-                        f"Capped to schedule ({scheduled_hours:.2f} hrs)"
+                # Cap to the SCHEDULED WINDOW, not just the daily total. A late
+                # arrival or early departure must not be recovered by staying
+                # late, coming in early, or taking a shorter break than
+                # scheduled (Megha, 2026-06-15). The worked window is clamped to
+                # the schedule (5-min grace per edge) and the FULL scheduled
+                # break is deducted regardless of the break actually taken.
+                #
+                # Only applied when the employee logged at least a full day's
+                # hours (actual >= scheduled). On a genuine short day we keep
+                # paying actual, so we never deduct a break that wasn't taken or
+                # dock hours below what was honestly worked. Corrected (missed-
+                # punch) days keep the plain cap since their raw punches are
+                # incomplete by definition.
+                window_paid = None
+                if record["corrected_hours"] is None:
+                    window_paid = paid_within_schedule(
+                        record["raw_first_in"], record["raw_last_out"],
+                        sched_start, sched_end,
+                        schedule_info.get("break_hours", 0.0),
                     )
-                final_work = min(actual_hours, scheduled_hours)
+
+                if window_paid is not None and actual_hours + 1e-6 >= scheduled_hours:
+                    final_work = round(min(actual_hours, window_paid), 2)
+                    if final_work + 1e-9 < min(actual_hours, scheduled_hours):
+                        brk = schedule_info.get("break_hours", 0.0)
+                        record["notes"].append(
+                            f"Capped to scheduled window "
+                            f"{sched_start.strftime('%I:%M %p').lstrip('0')}–"
+                            f"{sched_end.strftime('%I:%M %p').lstrip('0')} "
+                            f"(less {brk:g}h break) = {final_work:.2f} hrs"
+                        )
+                else:
+                    if actual_hours > scheduled_hours:
+                        record["notes"].append(
+                            f"Capped to schedule ({scheduled_hours:.2f} hrs)"
+                        )
+                    final_work = min(actual_hours, scheduled_hours)
 
         if special_rule and work_date == special_rule.get("date"):
             status = cell_to_text(meta.get("status")).lower()
