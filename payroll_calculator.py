@@ -1161,9 +1161,10 @@ def get_or_create_day(records, employee, work_date):
     return records[key]
 
 
-# Lateness/early-departure shorter than this is forgiven (trivial clock drift).
-# Anything longer is docked. Megha's preference (2026-06-15): 5-minute grace.
-LATE_GRACE = timedelta(minutes=5)
+# Grace on each schedule edge. Megha's preference (2026-06-15): NO grace —
+# dock lateness / early departure to the minute. Kept as a named constant so a
+# grace window can be reinstated by bumping this if that changes.
+LATE_GRACE = timedelta(minutes=0)
 
 
 def paid_within_schedule(first_in, last_out, sched_start, sched_end,
@@ -1172,10 +1173,10 @@ def paid_within_schedule(first_in, last_out, sched_start, sched_end,
 
     Implements Megha's rule (2026-06-15): a late arrival or early departure
     must NOT be recovered by staying late, coming in early, or taking a shorter
-    break. The worked window is clamped to [sched_start, sched_end], up to
-    `grace` minutes of lateness / early-departure is forgiven on each edge, and
-    then the FULL scheduled break is deducted regardless of the break actually
-    taken.
+    break. The worked window is clamped to [sched_start, sched_end] (lateness /
+    early-departure beyond `grace` is docked — `grace` defaults to 0, i.e. to
+    the minute), then the FULL scheduled break is deducted regardless of the
+    break actually taken.
 
     Returns the paid hours, or None when it can't be computed (a punch is
     missing, or the punches don't overlap the scheduled window at all) so the
@@ -1457,8 +1458,8 @@ def apply_notes(entries, notes, rules):
                 # arrival or early departure must not be recovered by staying
                 # late, coming in early, or taking a shorter break than
                 # scheduled (Megha, 2026-06-15). The worked window is clamped to
-                # the schedule (5-min grace per edge) and the FULL scheduled
-                # break is deducted regardless of the break actually taken.
+                # the schedule (docked to the minute, no grace) and the FULL
+                # scheduled break is deducted regardless of the break taken.
                 #
                 # Only applied when the employee logged at least a full day's
                 # hours (actual >= scheduled). On a genuine short day we keep

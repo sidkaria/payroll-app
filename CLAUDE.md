@@ -64,12 +64,12 @@ paid = (min(last_out, sched_end) − max(first_in, sched_start)) − full_break
 final = min(actual, paid)          # never above the plain cap
 ```
 
-A **5-minute grace** is applied on each edge (`LATE_GRACE`), so trivial clock
-drift isn't docked, but anything beyond is. The key consequence (Megha,
-2026-06-15): a **late arrival or early departure can't be recovered** by
-staying late, coming in early, or taking a shorter break than scheduled — and
-the full break is always deducted even if a shorter one was taken. The logic
-lives in `paid_within_schedule()`.
+Lateness / early departure is docked **to the minute — no grace** (`LATE_GRACE
+= 0`; kept as a named constant so a grace window can be reinstated if Megha
+changes her mind). The key consequence (Megha, 2026-06-15): a **late arrival or
+early departure can't be recovered** by staying late, coming in early, or
+taking a shorter break than scheduled — and the full break is always deducted
+even if a shorter one was taken. The logic lives in `paid_within_schedule()`.
 
 This only fires on full-day records. On a **genuine short day**
 (`actual < scheduled`) we keep paying actual (`min(actual, scheduled)`), so we

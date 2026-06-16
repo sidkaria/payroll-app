@@ -141,21 +141,22 @@ class CapToScheduledWindowTests(unittest.TestCase):
         rec = find_record(day_records, "Doe, Jane", "4/9/2026")
         self.assertAlmostEqual(rec["final_work_hours"], 7.5)
 
-    def test_lateness_beyond_grace_is_docked(self):
-        # In 8:06 (6 min late > 5-min grace), out 5:00, single punch = 8.9h.
+    def test_lateness_is_docked_to_the_minute(self):
+        # In 8:06 (6 min late), out 5:00, single punch = 8.9h.
         # Window 8:06→5:00 = 8.9h − 1h break = 7.9h.
         entries = [AdpEntry("Doe, Jane", "4/10/2026", "8:06 AM", "5:00 PM", 8.9)]
         _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
         rec = find_record(day_records, "Doe, Jane", "4/10/2026")
         self.assertAlmostEqual(rec["final_work_hours"], 7.9)
 
-    def test_small_lateness_within_grace_not_docked(self):
-        # In 8:04 (4 min late ≤ 5-min grace), out 5:04 (stayed late, clamped).
-        # Window treated as 8:00→5:00 = 9h − 1h break = 8.0h (full pay).
+    def test_small_lateness_is_docked_no_grace(self):
+        # No grace (Megha, 2026-06-15): even 4 min late is docked to the minute.
+        # In 8:04, out 5:04 (stay-late clamped to 5:00). Window 8:04→5:00 =
+        # 8.933h − 1h break = 7.93h.
         entries = [AdpEntry("Doe, Jane", "4/13/2026", "8:04 AM", "5:04 PM", 9.0)]
         _, _, day_records, _, _ = run_pipeline(entries, [self._row()])
         rec = find_record(day_records, "Doe, Jane", "4/13/2026")
-        self.assertAlmostEqual(rec["final_work_hours"], 8.0)
+        self.assertAlmostEqual(rec["final_work_hours"], 7.93)
 
     def test_partial_day_keeps_actual_no_phantom_break(self):
         # Worked an afternoon only: in 2:00 PM, out 5:00 PM = 3h actual, which
