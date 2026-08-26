@@ -49,7 +49,12 @@ class RealFixtureInvariantTests(unittest.TestCase):
         for adp_path, notes_path in pairs:
             with self.subTest(site=adp_path.name):
                 adp = parse_adp(str(adp_path))
-                notes = parse_notes(str(notes_path))
+                # Mirror the app: feed the ADP roster so the right notes tab is
+                # chosen in multi-tab workbooks.
+                notes = parse_notes(
+                    str(notes_path),
+                    adp_employees={e["employee"] for e in adp["entries"]},
+                )
                 rules = parse_workbook_rules(notes)
                 day_records, logs, leave_totals = apply_notes(adp["entries"], notes, rules)
 

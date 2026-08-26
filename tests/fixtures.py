@@ -72,10 +72,8 @@ class NotesWorkbook:
     sheet_name: str = "Sheet1"
 
 
-def write_notes_xlsx(path: Path, workbook_data: NotesWorkbook) -> Path:
-    """Build a notes workbook with the same layout the parser expects."""
-    wb = openpyxl.Workbook()
-    ws = wb.active
+def _fill_notes_sheet(ws, workbook_data: NotesWorkbook) -> None:
+    """Populate one worksheet with the notes layout the parser expects."""
     ws.title = workbook_data.sheet_name
 
     # Row 4: column headers (the parser searches col 1 for "Employee")
@@ -122,6 +120,23 @@ def write_notes_xlsx(path: Path, workbook_data: NotesWorkbook) -> Path:
         for offset, text in enumerate(workbook_data.prompts, start=1):
             ws.cell(prompt_row + offset, 1, text)
 
+
+def write_notes_xlsx(path: Path, workbook_data: NotesWorkbook) -> Path:
+    """Build a single-sheet notes workbook with the layout the parser expects."""
+    wb = openpyxl.Workbook()
+    _fill_notes_sheet(wb.active, workbook_data)
+    wb.save(path)
+    return path
+
+
+def write_multi_sheet_notes_xlsx(path: Path, sheets: list[NotesWorkbook]) -> Path:
+    """Build a notes workbook with several sheets, in order. Each NotesWorkbook's
+    sheet_name becomes the tab name. Used to test sheet selection (e.g. a stale
+    tab first, the real data tab second)."""
+    wb = openpyxl.Workbook()
+    for index, wd in enumerate(sheets):
+        ws = wb.active if index == 0 else wb.create_sheet()
+        _fill_notes_sheet(ws, wd)
     wb.save(path)
     return path
 

@@ -15,9 +15,26 @@ from payroll_calculator import (
     parse_adp,
     parse_notes,
     parse_workbook_rules,
+    pick_notes_sheet,
     weekday_dates_only,
     write_excel,
 )
+
+
+def _adp_employee_names(raw: bytes, filename: str):
+    """Parse the ADP export bytes and return the set of employee names (used to
+    auto-pick the matching notes tab)."""
+    ext = Path(filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+        f.write(raw)
+        tmp = f.name
+    try:
+        return {e["employee"] for e in parse_adp(tmp)["entries"]}
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -112,6 +129,35 @@ if notes_file:
             st.warning(f"Notes file warning: {notes_msg}")
             notes_ok = True  # still allow run, just warn
 
+# ── Notes tab selection (workbooks with more than one sheet) ───────────────────
+# Megha keeps one tab per pay period in a single workbook. Reading the wrong tab
+# silently drops that period's schedules / PTO / holiday, so let her confirm the
+# tab, defaulting to the one whose roster best matches the ADP export.
+selected_sheet = None
+if notes_file is not None and Path(notes_file.name).suffix.lower() in (".xlsx", ".xlsm") and notes_bytes:
+    try:
+        _wb = openpyxl.load_workbook(BytesIO(notes_bytes), data_only=True)
+        sheet_names = list(_wb.sheetnames)
+    except Exception:
+        _wb, sheet_names = None, []
+    if len(sheet_names) > 1:
+        default_sheet = sheet_names[0]
+        try:
+            adp_emps = _adp_employee_names(adp_bytes, adp_file.name) if adp_bytes else None
+            default_sheet = pick_notes_sheet(_wb, adp_emps)
+        except Exception:
+            pass
+        st.warning(
+            f"⚠ This notes workbook has **{len(sheet_names)} tabs**. Confirm the tab for "
+            "this pay period — the best match is selected by default."
+        )
+        selected_sheet = st.selectbox(
+            "Notes tab to use",
+            sheet_names,
+            index=sheet_names.index(default_sheet),
+            help="The tab whose employee list best matches your ADP export is picked automatically.",
+        )
+
 # ── Run button ────────────────────────────────────────────────────────────────
 
 both_uploaded = adp_file is not None and notes_file is not None
@@ -152,7 +198,12 @@ if run:
             # Core calculation
             adp = parse_adp(tmp_csv)
             entries = adp["entries"]
-            notes = parse_notes(tmp_notes)
+            adp_employee_names = {e["employee"] for e in entries}
+            notes = parse_notes(
+                tmp_notes,
+                sheet_name=selected_sheet,
+                adp_employees=adp_employee_names,
+            )
             rules = parse_workbook_rules(notes)
             day_records, logs, leave_totals = apply_notes(entries, notes, rules)
 
@@ -191,6 +242,15 @@ if run:
 
         st.divider()
         st.subheader("Results")
+
+        # Show which notes tab was used, so a wrong tab can't slip by unnoticed.
+        _sheets = notes.get("available_sheets") or []
+        if len(_sheets) > 1:
+            st.info(
+                f"📄 Used notes tab **{notes.get('sheet_used')}** "
+                f"(workbook has {len(_sheets)} tabs: {', '.join(_sheets)}). "
+                "If that's the wrong period, pick another tab above and recalculate."
+            )
 
         all_employees = sorted(
             set(employee_meta.keys()) | {r["employee"] for r in day_records.values()},

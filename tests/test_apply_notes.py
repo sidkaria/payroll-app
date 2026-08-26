@@ -37,6 +37,7 @@ from tests.fixtures import (  # noqa: E402
     NotesWorkbook,
     temp_path,
     write_adp_csv,
+    write_multi_sheet_notes_xlsx,
     write_notes_xlsx,
 )
 
@@ -371,6 +372,85 @@ class NoScheduleEmployeeTests(unittest.TestCase):
         self.assertAlmostEqual(rec["final_work_hours"], 9.0)  # not capped
         review_emps = {item.get("employee") for item in logs.get("review", [])}
         self.assertIn("Stranger, Sam", review_emps)
+
+
+class MultiSheetSelectionTests(unittest.TestCase):
+    """Bug (2026-08-25): when the notes workbook has several tabs (Megha keeps
+    one per pay period), the parser read only the FIRST tab. If a stale tab was
+    first, its Time Off / Holiday were missing. Fix: pick the tab whose roster
+    best matches the ADP export."""
+
+    def _build(self, entries, sheets):
+        csv_path = temp_path(".csv")
+        xlsx_path = temp_path(".xlsx")
+        write_adp_csv(csv_path, "4/6/2026", "4/17/2026", entries)
+        write_multi_sheet_notes_xlsx(xlsx_path, sheets)
+        adp = parse_adp(str(csv_path))
+        adp_emps = {e["employee"] for e in adp["entries"]}
+        notes = parse_notes(str(xlsx_path), adp_employees=adp_emps)
+        rules = parse_workbook_rules(notes)
+        day_records, logs, leave_totals = apply_notes(adp["entries"], notes, rules)
+        for p in (csv_path, xlsx_path):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        return notes, day_records, logs, leave_totals
+
+    def test_picks_tab_matching_adp_roster_so_pto_pulls(self):
+        # ADP has Doe + Roe. Stale tab (FIRST) has Doe + Oscar, no leave. Real
+        # tab (second) has Doe + Roe with Time Off. Must read the real tab.
+        entries = [
+            AdpEntry("Doe, Jane", "4/7/2026", "9:00 AM", "6:00 PM", 8.0),
+            AdpEntry("Roe, Rick", "4/7/2026", "9:00 AM", "6:00 PM", 8.0),
+        ]
+        stale = NotesWorkbook(sheet_name="stale_0814", rows=[
+            NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break"),
+            NoteRow(name="Old, Oscar", schedule="9:00 am - 6:00 pm", break_time="1 hour break"),
+        ])
+        real = NotesWorkbook(sheet_name="real_0824", rows=[
+            NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break", time_off_hours="8"),
+            NoteRow(name="Roe, Rick", schedule="9:00 am - 6:00 pm", break_time="1 hour break", time_off_hours="16"),
+        ])
+        notes, _, _, leave_totals = self._build(entries, [stale, real])
+        self.assertEqual(notes.get("sheet_used"), "real_0824")
+        self.assertAlmostEqual(leave_totals["Doe, Jane"]["Time Off"], 8.0)
+        self.assertAlmostEqual(leave_totals["Roe, Rick"]["Time Off"], 16.0)
+
+    def test_single_sheet_still_used(self):
+        # A one-tab workbook must behave exactly as before.
+        entries = [AdpEntry("Doe, Jane", "4/7/2026", "9:00 AM", "6:00 PM", 8.0)]
+        only = NotesWorkbook(sheet_name="only", rows=[
+            NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break", time_off_hours="8"),
+        ])
+        notes, _, _, leave_totals = self._build(entries, [only])
+        self.assertEqual(notes.get("sheet_used"), "only")
+        self.assertAlmostEqual(leave_totals["Doe, Jane"]["Time Off"], 8.0)
+
+    def test_explicit_sheet_name_overrides_autopick(self):
+        # An explicit sheet_name must win over the auto-picker.
+        entries = [AdpEntry("Doe, Jane", "4/7/2026", "9:00 AM", "6:00 PM", 8.0)]
+        a = NotesWorkbook(sheet_name="tab_a", rows=[
+            NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break", time_off_hours="8"),
+        ])
+        b = NotesWorkbook(sheet_name="tab_b", rows=[
+            NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break", time_off_hours="40"),
+        ])
+        csv_path = temp_path(".csv")
+        xlsx_path = temp_path(".xlsx")
+        write_adp_csv(csv_path, "4/6/2026", "4/17/2026", entries)
+        write_multi_sheet_notes_xlsx(xlsx_path, [a, b])
+        adp = parse_adp(str(csv_path))
+        notes = parse_notes(str(xlsx_path), sheet_name="tab_b")
+        rules = parse_workbook_rules(notes)
+        _, _, leave_totals = apply_notes(adp["entries"], notes, rules)
+        for p in (csv_path, xlsx_path):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        self.assertEqual(notes.get("sheet_used"), "tab_b")
+        self.assertAlmostEqual(leave_totals["Doe, Jane"]["Time Off"], 40.0)
 
 
 if __name__ == "__main__":

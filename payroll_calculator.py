@@ -919,17 +919,79 @@ def parse_workbook_prompts(worksheet):
     return prompts
 
 
-def parse_xlsx_notes(path):
+def _find_header_row(worksheet):
+    """Row whose col 1 == 'Employee', tolerating blank rows at the top."""
+    for r in range(1, min(20, worksheet.max_row + 1)):
+        if cell_to_text(worksheet.cell(r, 1).value).strip() == "Employee":
+            return r
+    return None
+
+
+def _scan_notes_sheet(worksheet):
+    """Cheap scan of a candidate notes sheet for the sheet picker.
+
+    Returns (employee_norm_set, n_employees, n_schedule, n_leave). A sheet with
+    no 'Employee' header row scores empty so it's never chosen over a real one.
+    """
+    header_row = _find_header_row(worksheet)
+    if header_row is None:
+        return set(), 0, 0, 0
+    has_break = "break" in cell_to_text(worksheet.cell(header_row, 4).value).strip().lower()
+    o = 1 if has_break else 0
+    emps = set()
+    n_emp = n_sched = n_leave = 0
+    for r in range(header_row + 2, worksheet.max_row + 1):
+        name = cell_to_text(worksheet.cell(r, 1).value)
+        if name == "Additional Notes:":
+            break
+        if not name:
+            continue
+        n_emp += 1
+        emps.add(normalize_name(name))
+        if cell_to_text(worksheet.cell(r, 3).value).strip():
+            n_sched += 1
+        if worksheet.cell(r, 9 + o).value or worksheet.cell(r, 11 + o).value:
+            n_leave += 1
+    return emps, n_emp, n_sched, n_leave
+
+
+def pick_notes_sheet(workbook, adp_employees=None):
+    """Choose which sheet holds the current payroll notes.
+
+    Megha keeps one sheet per pay period in a single workbook, so the first
+    sheet is often a stale/previous tab (2026-08-25 bug: PTO/holiday silently
+    dropped because the parser only read sheet 0). We pick the sheet whose
+    roster best matches the ADP export, breaking ties by how much data the sheet
+    carries (schedules + leave), then by sheet order (later = newer). With a
+    single sheet this returns it unchanged.
+    """
+    names = list(workbook.sheetnames)
+    if len(names) == 1:
+        return names[0]
+
+    target = {normalize_name(n) for n in (adp_employees or set())}
+    best_name, best_score = names[0], None
+    for name in names:
+        emps, n_emp, n_sched, n_leave = _scan_notes_sheet(workbook[name])
+        overlap = len(emps & target) if target else 0
+        score = (overlap, n_sched + n_leave, n_emp)
+        # >= so that, on an exact tie, a later (newer) sheet wins.
+        if best_score is None or score >= best_score:
+            best_score, best_name = score, name
+    return best_name
+
+
+def parse_xlsx_notes(path, sheet_name=None, adp_employees=None):
     workbook = openpyxl.load_workbook(path, data_only=True)
-    worksheet = workbook[workbook.sheetnames[0]]
+    if sheet_name and sheet_name in workbook.sheetnames:
+        chosen = sheet_name
+    else:
+        chosen = pick_notes_sheet(workbook, adp_employees)
+    worksheet = workbook[chosen]
 
     # Find the header row dynamically — it's the row whose col 1 = "Employee".
     # This tolerates blank rows at the top that vary file to file.
-    header_row = None
-    for r in range(1, min(20, worksheet.max_row + 1)):
-        if cell_to_text(worksheet.cell(r, 1).value).strip() == "Employee":
-            header_row = r
-            break
+    header_row = _find_header_row(worksheet)
     if header_row is None:
         header_row = 2  # fallback
 
@@ -945,6 +1007,8 @@ def parse_xlsx_notes(path):
 
     notes = {
         "source_type": "xlsx",
+        "sheet_used": chosen,
+        "available_sheets": list(workbook.sheetnames),
         "employees": {},
         "missed_punches": [],
         "outside_schedule": [],
@@ -1065,12 +1129,12 @@ def parse_xlsx_notes(path):
     return notes
 
 
-def parse_notes(path):
+def parse_notes(path, sheet_name=None, adp_employees=None):
     suffix = Path(path).suffix.lower()
     if suffix == ".docx":
         return parse_docx_notes(path)
     if suffix in (".xlsx", ".xlsm"):
-        return parse_xlsx_notes(path)
+        return parse_xlsx_notes(path, sheet_name=sheet_name, adp_employees=adp_employees)
     raise ValueError(f"Unsupported notes file: {path}")
 
 
@@ -1844,7 +1908,10 @@ def main():
     print(f"  -> {len(entries)} punch rows across {len(set(entry['employee'] for entry in entries))} employees")
 
     print(f"Reading payroll notes: {notes_path}")
-    notes = parse_notes(notes_path)
+    notes = parse_notes(notes_path, adp_employees={e["employee"] for e in entries})
+    if len(notes.get("available_sheets", [])) > 1:
+        print(f"  -> notes workbook has {len(notes['available_sheets'])} tabs "
+              f"{notes['available_sheets']}; using {notes.get('sheet_used')!r}")
     print(
         "  -> "
         f"{len(notes.get('employees', {}))} employee note rows, "

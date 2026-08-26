@@ -42,10 +42,15 @@ ADP CSVs and notes XLSX files in temp dirs with placeholder names like
    | 11–12| Holiday (Date, Hours)          | date required; hours paid as-is           |
    | 13  | Notes                           | informational                             |
 
-   **Multi-sheet caveat:** the parser reads only the first sheet. If
-   Megha keeps an empty `Sample Template` tab in front of the real data
-   tab, she must remove the template (or move it after the data tab) so
-   the data sheet is the first one.
+   **Multi-sheet workbooks:** Megha keeps one tab per pay period (plus
+   sometimes a `Sample Template` tab). The parser no longer blindly reads
+   sheet 0 — `pick_notes_sheet()` chooses the tab whose roster best
+   overlaps the ADP export (tie-break: most schedule+leave data, then later
+   tab). `parse_notes(path, sheet_name=..., adp_employees=...)` lets callers
+   override or feed the ADP roster. The app shows the chosen tab and offers
+   a dropdown to override it; `notes["sheet_used"]` / `["available_sheets"]`
+   carry the result. This fixed the 2026-08-25 bug where a stale first tab
+   silently dropped that period's PTO/holiday (and schedules).
 
 ## Calculation behavior
 
