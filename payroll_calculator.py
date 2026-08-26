@@ -23,7 +23,10 @@ from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
-import docx
+# NOTE: python-docx (`import docx`) is imported lazily inside parse_docx_notes.
+# It pulls in compiled lxml, which can fail to import on a freshly rebuilt
+# deploy environment — and the .docx path is legacy (Megha uploads .xlsx), so a
+# broken docx must never take down the whole app at import time.
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -820,6 +823,14 @@ def _extract_kv(cells):
 
 
 def parse_docx_notes(path):
+    try:
+        import docx  # lazy: keep the app importable even if python-docx/lxml is broken
+    except ImportError as exc:
+        raise ValueError(
+            "Reading .docx notes needs python-docx, which isn't available here. "
+            "Please save the notes as .xlsx and upload that instead."
+        ) from exc
+
     notes = {
         "source_type": "docx",
         "employees": {},
