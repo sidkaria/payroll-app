@@ -168,6 +168,30 @@ class CapToScheduledWindowTests(unittest.TestCase):
         rec = find_record(day_records, "Doe, Jane", "4/14/2026")
         self.assertAlmostEqual(rec["final_work_hours"], 3.0)
 
+    def _megha_day(self, out_time, out_hours, break_back="1:45 PM"):
+        # Megha's report (2026-09 call): schedule 9–6 w/ 1h break, came in 9:15,
+        # took a 45-min break (clocked), left slightly before 6.
+        return run_pipeline(
+            [AdpEntry("Doe, Jane", "4/16/2026", "9:15 AM", "1:00 PM", 3.75),
+             AdpEntry("Doe, Jane", "4/16/2026", break_back, out_time, out_hours)],
+            [NoteRow(name="Doe, Jane", schedule="9:00 am - 6:00 pm", break_time="1 hour break")],
+        )
+
+    def test_late_short_break_leaving_two_minutes_early_is_docked(self):
+        # Present 9:15–5:58 = 8.72h ≥ 8h paid day → full day: 8.72 − 1 = 7.72.
+        # (Bug: total 7.97 < 8 failed the old worked-hours gate → paid 7.97.)
+        _, _, d, _, _ = self._megha_day("5:58 PM", 4.22)
+        self.assertAlmostEqual(find_record(d, "Doe, Jane", "4/16/2026")["final_work_hours"], 7.72)
+
+    def test_late_thirty_min_break_leaving_twenty_early_is_docked(self):
+        # Present 9:15–5:40 = 8.42h → 8.42 − 1 = 7.42 (bug paid 7.92).
+        _, _, d, _, _ = self._megha_day("5:40 PM", 4.17, break_back="1:30 PM")
+        self.assertAlmostEqual(find_record(d, "Doe, Jane", "4/16/2026")["final_work_hours"], 7.42)
+
+    def test_megha_exact_example_still_docked(self):
+        _, _, d, _, _ = self._megha_day("6:00 PM", 4.25)
+        self.assertAlmostEqual(find_record(d, "Doe, Jane", "4/16/2026")["final_work_hours"], 7.75)
+
     def test_perfect_attendance_still_pays_full_schedule(self):
         # On time, leaves on time, no clocked break (single punch) = 9h actual.
         # Window 8:00→5:00 = 9h − 1h break = 8.0h. No reduction for a clean day.

@@ -1536,12 +1536,16 @@ def apply_notes(entries, notes, rules):
                 # the schedule (docked to the minute, no grace) and the FULL
                 # scheduled break is deducted regardless of the break taken.
                 #
-                # Only applied when the employee logged at least a full day's
-                # hours (actual >= scheduled). On a genuine short day we keep
-                # paying actual, so we never deduct a break that wasn't taken or
-                # dock hours below what was honestly worked. Corrected (missed-
-                # punch) days keep the plain cap since their raw punches are
-                # incomplete by definition.
+                # Only applied on a FULL day: the employee either logged a full
+                # day's hours (actual >= scheduled) or was PRESENT inside the
+                # window for at least a full paid day (presence >= scheduled).
+                # The presence test matters: late + short break + leaving a few
+                # minutes early pushes worked hours just under the schedule, and
+                # gating on hours alone let that day escape the rule entirely
+                # (Megha, 2026-09: "came in 9:15, took a 45-min break, still got
+                # ~8 hours"). On a genuine short day we keep paying actual, so we
+                # never deduct a break that wasn't taken. Corrected (missed-punch)
+                # days keep the plain cap since their raw punches are incomplete.
                 window_paid = None
                 if record["corrected_hours"] is None:
                     window_paid = paid_within_schedule(
@@ -1550,7 +1554,11 @@ def apply_notes(entries, notes, rules):
                         schedule_info.get("break_hours", 0.0),
                     )
 
-                if window_paid is not None and actual_hours + 1e-6 >= scheduled_hours:
+                full_day = window_paid is not None and (
+                    actual_hours + 1e-6 >= scheduled_hours
+                    or window_paid + schedule_info.get("break_hours", 0.0) + 1e-6 >= scheduled_hours
+                )
+                if full_day:
                     final_work = round(min(actual_hours, window_paid), 2)
                     if final_work + 1e-9 < min(actual_hours, scheduled_hours):
                         brk = schedule_info.get("break_hours", 0.0)
